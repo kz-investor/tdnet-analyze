@@ -15,6 +15,9 @@ from vertexai.generative_models import GenerativeModel
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import random
+from google.api_core import exceptions
 
 # ロギング設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -51,14 +54,26 @@ except FileNotFoundError as e:
 
 def summarize_text_with_vertex(project: str, location: str, model_name: str, system_prompt: str, user_prompt: str) -> str:
     """システムプロンプトとユーザープロンプトを分けてLLMにリクエストする"""
-    try:
-        vertexai.init(project=project, location=location)
-        model = GenerativeModel(model_name, system_instruction=system_prompt)
-        response = model.generate_content(user_prompt)
-        return response.text
-    except Exception as e:
-        logger.error(f"Vertex AI API呼び出し中にエラー: {e}")
-        raise
+    max_retries = 5
+    initial_backoff = 2  # seconds
+
+    for attempt in range(max_retries):
+        try:
+            vertexai.init(project=project, location=location)
+            model = GenerativeModel(model_name, system_instruction=system_prompt)
+            response = model.generate_content(user_prompt)
+            return response.text
+        except exceptions.ResourceExhausted as e:
+            if attempt < max_retries - 1:
+                wait_time = initial_backoff * (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"Vertex AI APIでリソース枯渇エラー(429)が発生しました。{wait_time:.2f}秒待機して再試行します。(試行 {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Vertex AI APIの呼び出しが最大再試行回数({max_retries}回)に達しました。エラー: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"Vertex AI API呼び出し中に予期せぬエラー: {e}")
+            raise
 
 
 def safe_name(name: str, max_len: int = 50) -> str:
@@ -84,7 +99,8 @@ def generate_sector_insights(dates: list[str], bucket: str, base: str, project: 
 
     all_blobs = []
     for date_str in dates:
-        prefix = f"{base}/insights-summaries/{date_str}/"
+        path_parts = [base, "insights-summaries", date_str]
+        prefix = "/".join(part for part in path_parts if part) + "/"
         blobs = list(client.list_blobs(bucket_obj, prefix=prefix))
         if not blobs:
             logger.warning(f"GCSに処理対象の個別サマリーファイルが見つかりません: gs://{bucket}/{prefix}")
@@ -143,7 +159,9 @@ def generate_sector_insights(dates: list[str], bucket: str, base: str, project: 
             sector_size_key = future_to_sector[future]
             try:
                 insight_text = future.result()
-                insight_gcs_path = f"{base}/insights-sectors/{output_date_str}/{safe_name(sector_size_key)}_insights.md"
+                filename = f"{safe_name(sector_size_key)}_insights.md"
+                path_parts = [base, "insights-sectors", output_date_str, filename]
+                insight_gcs_path = "/".join(part for part in path_parts if part)
                 blob = client.bucket(bucket).blob(insight_gcs_path)
                 blob.upload_from_string(insight_text.encode('utf-8'), content_type="text/markdown")
                 logger.info(f"セクター+規模インサイトをGCSにアップロードしました: gs://{bucket}/{insight_gcs_path}")

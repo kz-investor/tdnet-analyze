@@ -24,8 +24,15 @@ def trigger_scraper(request):
     リクエストで日付が指定されていない場合は、JSTの今日の日付を使用する。
     """
     try:
-        # 日付の決定
-        date_str = request.args.get('date') if request.args else None
+        # 日付の決定ロジックを修正
+        # POST (gcloud scheduler) のJSONボディと、GETのクエリ引数の両方に対応
+        date_str = None
+        request_json = request.get_json(silent=True)
+        if request_json and 'date' in request_json:
+            date_str = request_json['date']
+        elif request.args and 'date' in request.args:
+            date_str = request.args.get('date')
+
         if not date_str:
             jst = pytz.timezone('Asia/Tokyo')
             date_str = datetime.now(jst).strftime('%Y%m%d')

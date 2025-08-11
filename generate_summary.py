@@ -21,6 +21,9 @@ from vertexai.generative_models import GenerativeModel
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import random
+from google.api_core import exceptions
 
 # ロギング設定（Cloud Functions対応）
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -122,7 +125,9 @@ class DocumentGroup:
 
 def load_metadata(client: storage.Client, bucket: str, base: str, date_str: str) -> Dict:
     year, month, day = date_str[:4], date_str[4:6], date_str[6:8]
-    path = f"{base}/{year}/{month}/{day}/metadata_{date_str}.json"
+    filename = f"metadata_{date_str}.json"
+    path_parts = [base, year, month, day, filename]
+    path = "/".join(part for part in path_parts if part)
     blob = client.bucket(bucket).blob(path)
     data = blob.download_as_bytes()
     import json
@@ -191,16 +196,28 @@ def extract_text_from_pdf_blob(blob: storage.Blob) -> str:
 
 def summarize_text_with_vertex(project: str, location: str, model_name: str, system_prompt: str, user_prompt: str, content: str) -> str:
     """システムプロンプトとユーザープロンプトを分けてLLMにリクエストする"""
-    try:
-        vertexai.init(project=project, location=location)
-        model = GenerativeModel(model_name, system_instruction=system_prompt)
-        response = model.generate_content(
-            user_prompt + "\n\n" + content,
-        )
-        return response.text
-    except Exception as e:
-        logger.error(f"Vertex AI API呼び出し中にエラー: {e}")
-        raise
+    max_retries = 5
+    initial_backoff = 2  # seconds
+
+    for attempt in range(max_retries):
+        try:
+            vertexai.init(project=project, location=location)
+            model = GenerativeModel(model_name, system_instruction=system_prompt)
+            response = model.generate_content(
+                user_prompt + "\n\n" + content,
+            )
+            return response.text
+        except exceptions.ResourceExhausted as e:
+            if attempt < max_retries - 1:
+                wait_time = initial_backoff * (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"Vertex AI APIでリソース枯渇エラー(429)が発生しました。{wait_time:.2f}秒待機して再試行します。(試行 {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Vertex AI APIの呼び出しが最大再試行回数({max_retries}回)に達しました。エラー: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"Vertex AI API呼び出し中に予期せぬエラー: {e}")
+            raise
 
 
 def safe_name(name: str, max_len: int = 50) -> str:
@@ -380,7 +397,8 @@ def generate_summaries(dates: List[str], bucket: str = DEFAULT_BUCKET, base: str
                 logger.info(f"({processed_groups_count}/{total_groups}) 要約成功: コード={group.code}")
 
                 summary_filename = f"{output_date_str}__{safe_name(group.sector)}__{safe_name(group.size)}__{group.code}__{safe_name(group.name)}_summary.md"
-                summary_gcs_path = f"{base}/insights-summaries/{output_date_str}/{summary_filename}"
+                path_parts = [base, "insights-summaries", output_date_str, summary_filename]
+                summary_gcs_path = "/".join(part for part in path_parts if part)
 
                 try:
                     blob = client.bucket(bucket).blob(summary_gcs_path)

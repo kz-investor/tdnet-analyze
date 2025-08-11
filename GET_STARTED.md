@@ -40,14 +40,14 @@ gsutil mb -l $REGION gs://$BUCKET_NAME
 ## 5. デプロイ
 リポジトリのルートディレクトリで `deploy.sh` を実行します。このスクリプトが、すべてのGoogle Cloudリソース（Cloud Function, Cloud Run ジョブ, Cloud Scheduler）のデプロイと設定を自動で行います。
 
-**重要**: スクリプトの初回実行時には、ローカル環境の認証情報を使ってGCPリソースを作成するため、ご自身のユーザーアカウントに十分な権限（プロジェクト編集者など）があることを確認してください。
+**重要**: `deploy.sh` は、引数としてサービスアカウントキーのJSONファイルパスと、プロジェクトIDを必要とします。
 
 ```bash
 # スクリプトに実行権限を付与（初回のみ）
-chmod +x deploy.sh run_manual_batch.sh
+chmod +x deploy.sh run_manual_batch.sh run_scraper_via_scheduler.sh
 
-# デプロイスクリプトを実行
-./deploy.sh
+# デプロイスクリプトを実行。引数にキーファイルとプロジェクトIDを渡す。
+./deploy.sh --key-file keys/<YOUR_SERVICE_ACCOUNT_KEY>.json --project-id <YOUR_PROJECT_ID>
 ```
 これにより、以下のリソースが構築され、日次のPDF自動収集が有効になります。
 - **Cloud Function**: `tdnet-scraper`
@@ -57,18 +57,19 @@ chmod +x deploy.sh run_manual_batch.sh
 ## 6. 動作確認
 
 ### 日次スクレイピングのテスト実行
-デプロイされたCloud Schedulerジョブを手動で実行することで、日次のスクレイピング機能が正しく動作するかを確認できます。
+デプロイされたCloud Schedulerジョブを手動で実行することで、日次のスクレイピング機能が正しく動作するかを確認できます。`run_scraper_via_scheduler.sh` は、このプロセスを安全に自動化するものです。
 
 ```bash
-gcloud scheduler jobs run tdnet-scraper-daily-trigger --location $REGION
+# 特定の日付を指定して安全に手動実行
+./run_scraper_via_scheduler.sh --date 20240101 --key-file keys/<YOUR_SERVICE_ACCOUNT_KEY>.json --project-id <YOUR_PROJECT_ID>
 ```
 
 ### 分析バッチのテスト実行
-`run_manual_batch.sh` を使って、指定した期間の分析バッチ処理を手動で実行します。
+`run_manual_batch.sh` を使って、指定した期間の分析バッチ処理を手動で実行します。このスクリプトも、引数としてサービスアカウントキーとプロジェクトIDを必要とします。
 
 ```bash
-# 2023年1月1日から1月1日までのデータを対象に分析バッチを実行する例
-./run_manual_batch.sh --start-date 20230101 --end-date 20230101
+# 分析バッチを実行する例
+./run_manual_batch.sh --start-date 20230101 --end-date 20230101 --key-file keys/<YOUR_SERVICE_ACCOUNT_KEY>.json --project-id <YOUR_PROJECT_ID>
 ```
 
 ### ログ確認
@@ -89,9 +90,9 @@ gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=td
 個別のスクリプトをローカル環境で実行することも可能です。
 
 - **認証設定**:
-  `gcloud` CLI経由でアプリケーションのデフォルト認証情報を設定します。
+  環境変数 `GOOGLE_APPLICATION_CREDENTIALS` に、サービスアカウントキーのJSONファイルへのパスを設定します。
   ```bash
-  gcloud auth application-default login
+  export GOOGLE_APPLICATION_CREDENTIALS="keys/<YOUR_SERVICE_ACCOUNT_KEY>.json"
   ```
 
 - **依存インストール**:
@@ -112,5 +113,5 @@ gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=td
   ```
 
 ## トラブルシュート（IAM）
-- **デプロイ時の権限エラー**: `deploy.sh`を実行するユーザーアカウントに、プロジェクトに対する十分な権限（例: `roles/editor`）があることを確認してください。
+- **デプロイ時の権限エラー**: `deploy.sh`を実行する際、`gcloud auth activate-service-account`で有効化したサービスアカウントに、プロジェクトに対する十分な権限（例: `roles/editor`）があることを確認してください。
 - **実行時の権限エラー**: `tdnet-analyzer-sa`サービスアカウントに、必要なロール（`roles/storage.objectAdmin`, `roles/run.invoker`など）が付与されているか、GCPコンソールのIAMページで確認してください。`deploy.sh`がこれらの権限を自動で設定します。 

@@ -99,6 +99,7 @@ tdnet-analyzer/
 │   ├── Dockerfile               # Cloud Run用コンテナ定義
 │   ├── deploy.sh                # Cloudリソースのデプロイスクリプト
 │   ├── run_manual_batch.sh      # 分析バッチの手動実行スクリプト
+│   ├── run_scraper_via_scheduler.sh # ★安全な手動スクレイピング実行スクリプト
 │   ├── deploy.env               # デプロイ用環境変数
 │   ├── requirements.txt         # ローカル開発用依存関係
 │   └── requirements-functions.txt # Cloud Function/Cloud Run用依存関係
@@ -145,10 +146,10 @@ tdnet-analyzer/
 
 ```bash
 # スクリプトに実行権限を付与（初回のみ）
-chmod +x deploy.sh run_manual_batch.sh
+chmod +x deploy.sh run_manual_batch.sh run_scraper_via_scheduler.sh
 
-# サービスアカウントキーを指定してデプロイスクリプトを実行
-./deploy.sh keys/<YOUR_SERVICE_ACCOUNT_KEY>.json
+# サービスアカウントキーとプロジェクトIDを指定してデプロイスクリプトを実行
+./deploy.sh --key-file keys/<YOUR_SERVICE_ACCOUNT_KEY>.json --project-id <YOUR_PROJECT_ID>
 ```
 これにより、日次のPDF自動収集が有効になります。
 
@@ -157,12 +158,21 @@ chmod +x deploy.sh run_manual_batch.sh
 任意のタイミングで、過去の指定した期間のPDFを分析し、サマリーとインサイトを生成することができます。
 
 ```bash
-# 2023年1月1日から1月7日までのデータを対象に分析バッチを実行
-./run_manual_batch.sh --start-date 20230101 --end-date 20230107
+# 期間、サービスアカウントキー、プロジェクトIDを指定して分析バッチを実行
+./run_manual_batch.sh --start-date 20230101 --end-date 20230107 --key-file keys/<YOUR_SERVICE_ACCOUNT_KEY>.json --project-id <YOUR_PROJECT_ID>
 ```
 このスクリプトは、サマリー生成ジョブの完了を待ってから、インサイト生成ジョブを自動で実行します。処理の進捗はターミナルに表示されます。
 
-### 3. ローカルでの実行（デバッグ用）
+### 3. 個別の日次データ取得（安全な手動実行）
+
+過去の特定の日付のデータが欠損している場合など、任意の日付を指定して安全に手動スクレイピングを実行できます。このスクリプトはCloud Schedulerの設定を一時的に変更し、実行後に必ず元の状態に復元します。
+
+```bash
+# 日付、サービスアカウントキー、プロジェクトIDを指定して手動スクレイピングを実行
+./run_scraper_via_scheduler.sh --date 20240101 --key-file keys/<YOUR_SERVICE_ACCOUNT_KEY>.json --project-id <YOUR_PROJECT_ID>
+```
+
+### 4. ローカルでの実行（デバッグ用）
 
 個別のスクリプトをローカル環境で実行して、部分的な動作確認やデバッグを行うことも可能です。
 

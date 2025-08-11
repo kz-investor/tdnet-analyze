@@ -18,3 +18,4 @@ COPY . .
 # このDockerfileはCloud Runジョブで直接スクリプトを実行するために使用されます。
 # CMDやENTRYPOINTは、gcloud run jobs deployコマンドの--commandおよび--argsで
 # オーバーライドされるため、ここでは設定しません。 
+ENTRYPOINT ["python3"] 

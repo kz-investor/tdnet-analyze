@@ -214,11 +214,15 @@ class TDNetCloud(TDNetBase):
         # ディレクトリは分けず、日付配下にフラット保存
         if self.flat_per_day:
             filename = f"{company_code}_{safe_title}.pdf"
-            return f"{self.base_path}/{year}/{month}/{day}/{filename}"
+            # base_pathが空の場合を考慮
+            path_parts = [self.base_path, year, month, day, filename]
+            return "/".join(part for part in path_parts if part)
 
         # 従来レイアウト（doc_type配下）
         filename = f"{company_code}_{safe_title}.pdf"
-        return f"{self.base_path}/{year}/{month}/{day}/{doc_type}/{filename}"
+        # base_pathが空の場合を考慮
+        path_parts = [self.base_path, year, month, day, doc_type, filename]
+        return "/".join(part for part in path_parts if part)
 
     def _process_documents_cloud(self, data_list: List[Dict], date_str: str) -> int:
         """Cloud用の文書処理（PDFダウンロード + GCSアップロード）"""
@@ -377,7 +381,11 @@ class TDNetCloud(TDNetBase):
                 year = date_str[:4]
                 month = date_str[4:6]
                 day = date_str[6:8]
-                gcs_path = f"{self.base_path}/{year}/{month}/{day}/metadata_{date_str}.json"
+
+                # base_pathが空の場合を考慮
+                filename = f"metadata_{date_str}.json"
+                path_parts = [self.base_path, year, month, day, filename]
+                gcs_path = "/".join(part for part in path_parts if part)
 
                 if self._upload_to_gcs(temp_file.name, gcs_path):
                     self.logger.info(f"メタデータをGCSに保存しました: {gcs_path}")
