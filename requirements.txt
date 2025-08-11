@@ -1,0 +1,14 @@
+# スクレイピング
+requests>=2.31.0
+urllib3>=2.0.7
+beautifulsoup4>=4.12.0
+PyYAML>=6.0.1
+pytz>=2023.3
+
+# Google Cloud
+google-cloud-storage>=2.10.0
+google-cloud-aiplatform>=1.38.0
+
+# PDF処理
+pypdf>=3.0.0
+pymupdf>=1.23.0 

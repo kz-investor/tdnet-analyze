@@ -1,0 +1,73 @@
+# 適時開示データ取得システム設定
+
+# データ取得設定
+data_fetch:
+  base_url: "https://www.release.tdnet.info/inbs/"
+  file_pattern: "I_list_{:03d}_{}.html"  # I_list_001_20250807.html の形式
+  start_index: 1
+  max_pages: 1000  # 404が出るまで続行
+
+# 取得対象データ
+target_documents:
+  - "決算短信"
+  - "決算説明資料"
+  - "補足資料"
+  - "プレゼンテーション資料"
+  - "配当"
+  - "配当政策"
+  - "剰余金の配当"
+
+# 保存設定
+save:
+  result_dir: "result"
+  file_format: "{date}_{code}_{type}.pdf"
+  
+# ファイル命名規則
+naming_rules:
+  tanshin: "決算短信"
+  presentation: ["決算説明資料", "補足資料", "プレゼンテーション資料"]
+  dividend: ["配当", "配当政策", "剰余金の配当"]
+  other: "その他"
+  
+# ファイル名マッピング
+file_type_mapping:
+  tanshin: "tanshin"
+  presentation: "presentation"
+  dividend: "dividend"
+  other: "other"
+
+# ログ設定
+logging:
+  level: "DEBUG"
+  file: "logs/scraping.log" 
+
+# スクレイピング設定
+scraping:
+  # マルチスレッド設定
+  multithread:
+    enabled: true
+    max_workers: 20        # 5 → 10 に増加（1000社対応）
+    timeout: 30
+
+# 保存設定
+save:
+  result_dir: "result"
+
+# GCS設定
+gcs:
+  bucket_name: "tdnet-documents"
+  base_path: "vertex-ai-rag"
+  # 1日配下をフラットに保存したい場合はtrue
+  flat_per_day: true
+
+# LLM設定
+llm:
+  model_name: "gemini-2.5-flash-lite"  # Vertex AI model (us-central1)
+  # LLM呼び出しの並列処理設定
+  parallel:
+    max_workers: 25
+  # プロンプト設定（prompt_templates/ 配下で管理）
+  # - 個別サマリー: 規模区分に応じて詳細版/コンパクト版を自動選択
+  #   - 大型株（Core30/Large70/Mid400）: summary_system_prompt.md
+  #   - 小型株（その他）: summary_system_prompt_small.md
+  # - セクターインサイト: sector_system_prompt.md（4ステップ構造化分析）
