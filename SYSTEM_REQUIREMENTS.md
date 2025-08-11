@@ -6,19 +6,21 @@
 
 - 目的: TDnetから対象（決算短信、配当関連、その他重要文書等）のPDFを取得し、GCSへ保存。Vertex AI Gemini LLMによる分析のためのデータを日次蓄積する。
 - 実行方式:
-  - 日次自動実行（JST 19:00）
-  - 任意日付の手動実行にも対応（?date=YYYYMMDD または JSON body）
+  - 日次自動実行（**JST 19:00**）
+  - 任意期間の手動バッチ実行に対応
   - ローカルでGCSから日付配下の成果物をダウンロードできること（検証・再処理用途）
 - 成果物:
   - PDFファイル
-  - 日次メタデータJSON（件数や種類、会社別集計、個別ドキュメント情報）
+  - 個別企業サマリー（Markdown形式）
+  - セクター別インサイト（Markdown形式）
 - 保存先構造:
-  - `vertex-ai-rag/{YYYY}/{MM}/{DD}/{document_type}/{company_code}_{title}.pdf`
-  - `vertex-ai-rag/{YYYY}/{MM}/{DD}/metadata_{YYYYMMDD}.json`
+  - PDF: `tdnet-analyzer/{YYYY}/{MM}/{DD}/{company_code}_{title}.pdf`
+  - 個別サマリー: `tdnet-analyzer/insights-summaries/{YYYYMMDD}/{yyyymmdd}__{sector}__{size}__{code}__{company_name}_summary.md`
+  - セクターインサイト: `tdnet-analyzer/insights-sectors/{YYYYMMDD}/{sector}__{size}_insights.md`
 - パフォーマンス/コスト:
   - 大量（1000件超）でも実用時間（数分〜十数分）
   - 無駄な常時起動は不可。都度実行で終了、コスト最小化
-  - メモリ使用を抑え、512MBで安定動作
+  - メモリ使用を抑え、**1024MB**で安定動作
 - 信頼性/安全性:
   - レート制御（1秒あたり最大5アクセス/スレッド）
   - 再試行（自動リトライ）は原則無効（事故コスト防止）
@@ -31,24 +33,55 @@
 ## 2. システム要件
 
 ### 2.1 アーキテクチャ
-- Cloud Scheduler → Cloud Functions（Gen2, HTTP）
-- Cloud Functionsが同一コードベースの`tdnet_cloud.py`を直接起動し、全処理を完結
-- 成果物はGCSへ保存
+
+本システムは、以下の2つの独立した処理フローから構成されるハイブリッドアーキテクチャを採用する。
+
+1.  **日次データ取得フロー（自動実行）**: 軽量で定時実行に適した**Cloud Function**を使用。Cloud Schedulerをトリガーとし、その日のTDnet開示PDFをGCSに収集・保存する。
+2.  **分析バッチ処理フロー（手動実行）**: 長時間実行（最大60分）と安定性が求められる分析処理には**Cloud Run ジョブ**を使用。ユーザーが手動でスクリプトを実行すると起動し、指定された期間のPDFを対象に、サマリー生成とインサイト抽出を順番に実行する。
+
+```mermaid
+graph TD
+    subgraph "日次データ取得フロー (自動)"
+        A[Cloud Scheduler<br/>毎日19時] --> B(Cloud Function<br/>tdnet-scraper);
+        B -- PDF保存 --> C[☁️ Google Cloud Storage<br/>tdnet-analyzer/YYYY/MM/DD/];
+    end
+
+    subgraph "分析バッチ処理フロー (手動)"
+        D[手動実行<br/>run_manual_batch.sh] --> E{Cloud Run ジョブ<br/>tdnet-summary-generator};
+        E -- 処理完了を待つ --> F{Cloud Run ジョブ<br/>tdnet-insight-generator};
+        
+        E -- PDF読み込み --> C;
+        E -- サマリー書き込み --> G[☁️ Google Cloud Storage<br/>tdnet-analyzer/insights-summaries/...];
+        F -- サマリー読み込み --> G;
+        F -- インサイト書き込み --> H[☁️ Google Cloud Storage<br/>tdnet-analyzer/insights-sectors/...];
+        
+        E -- LLM API --> I((Vertex AI<br/>Gemini));
+        F -- LLM API --> I;
+    end
+```
 
 ### 2.2 実行環境
-- Cloud Functions（Gen2）設定:
-  - Runtime: Python 3.11
-  - Timeout: 3000s（50分）
-  - Memory: 512MB
-  - CPU: 1
-  - Max instances: 1
-  - Retries: 0
-- ログ保持: Cloud Logging `_Default` バケット retention 3日
+
+-   **Cloud Function (`tdnet-scraper`) 設定:**
+    -   役割: 日次スクレイピング
+    -   Runtime: Python 3.11
+    -   Timeout: **540s** (9分)
+    -   Memory: **1Gi**
+    -   Retries: 0
+-   **Cloud Run ジョブ (`tdnet-summary-generator`, `tdnet-insight-generator`) 設定:**
+    -   役割: 期間指定のサマリー/インサイト生成
+    -   Timeout: **3600s** (60分)
+    -   Memory: **2Gi**
+    -   CPU: **1**
+    -   Tasks: 1 (同時実行数)
+-   **Cloud Scheduler (`tdnet-scraper-daily-trigger`) 設定:**
+    -   役割: Cloud Functionの定時実行トリガー
+    -   Schedule: `0 19 * * *` (JST 19:00)
 
 ### 2.3 依存関係管理
-- ローカル開発用: `requirements.txt`
-- 本番（Cloud Functions）用: `requirements-functions.txt`
-- デプロイ時のみ `requirements-functions.txt` を `requirements.txt` に一時差し替え、復元（`deploy.sh`）
+- `requirements.txt`: ローカル開発・デバッグ用。
+- `requirements-functions.txt`: Cloud FunctionおよびCloud Runジョブの本番環境用。
+- `Dockerfile`: `requirements-functions.txt` を `requirements.txt` としてコピーし、Cloud Runジョブ用のコンテナをビルドする。
 
 ### 2.4 スクレイピング設計
 - HTTPクライアント: `requests`ライブラリを使用。セッション管理を行い、効率的な通信を実現。
@@ -88,24 +121,24 @@ logging:
 scraping:
   multithread:
     enabled: true           # 必須
-    max_workers: 10         # 必須: I/O向けにCPU1でも>1可
+    max_workers: 20         # 必須: PDFダウンロード用並列数
     timeout: 30             # 任意: PDFダウンロードの秒数
 
 # companies.csv が存在すれば市場フィルタを適用
 # 除外市場は `constants.EXCLUDED_MARKETS_DEFAULT` を用いる（要件に応じて編集可）
 
 gcs:
-  bucket_name: "tdnet-documents"  # 必須
-  base_path: "vertex-ai-rag"      # 必須
-  flat_per_day: true               # 推奨: trueで日付配下フラット保存
+  # GCSバケット名
+  bucket_name: "tdnet-documents"
+  # GCS内のベースパス
+  base_path: "tdnet-analyzer"      # 必須
+  # 1日配下をフラットに保存したい場合はtrue
+  flat_per_day: true
 
-cloud_run: # Functions設定の参照用（実体はFunctions Gen2）
-  resources:
-    memory_limit: "512Mi"   # 必須: 512MB
-    cpu_limit: "1"          # 必須: 1 vCPU
-    timeout: "3000"         # 必須: 50分
-    max_retries: 0           # 必須: 自動リトライなし
-    max_instances: 1         # 必須: 同時実行1
+llm:
+  model_name: "gemini-2.5-flash-lite"
+  parallel:
+    max_workers: 25 # LLM呼び出し用並列数
 ```
 
 ### 2.7 実行モード（メモリ非蓄積の原則）
@@ -123,119 +156,46 @@ cloud_run: # Functions設定の参照用（実体はFunctions Gen2）
 - 任意日: `?date=YYYYMMDD` か JSON `{date:"YYYYMMDD"}` でHTTP POST
 - 監視: Cloud Logging（72時間）
 
-## 3. 既知のつまずきと回避策
-- Cloud Functionsで`gcloud` CLIは使えない → REST/SDKではなく、関数内で直接処理
-- Schedulerで動的日付埋め込み不可 → 関数で当日判定、手動時のみdate指定
-- HEADでの存在チェックは403 → GETに変更
-- PDFの相対URL → 絶対URL化
-- 依存の混載 → ローカル/本番で`requirements`を分離
-- アーキ誤解（常時HTTPサーバ前提） → 都度起動/即終了のFunctionsで統一
-- アーキ間違いによる大容量コンテナ/アーキ不整合 → Functions直実行に収束
-
-## 4. 品質目標
+## 3. 品質目標
 - 完了までの目標時間: 通常日 < 15分（データ量に依存）
 - 失敗時継続率: 部分失敗でも全体は継続処理
 - メモリ使用: 512MB内で安定
 
-## 5. インターフェース定義
+## 4. インターフェース定義
 - HTTP（Cloud Functions）
   - Method: POST
-  - Query: `?date=YYYYMMDD`（任意）
-  - JSON: `{ "date": "YYYYMMDD" }`（任意）
-  - レスポンス: `{ status: 'success'|'error', message: string }`
+  - Trigger: Cloud Scheduler (OIDC認証) または 認証済みgcloudコマンド
+  - Query Parameter: `?date=YYYYMMDD`（任意）
+    - 指定がない場合は、実行時のJST（Asia/Tokyo）の現在日付が使用される。
+  - Body: なし
+  - レスポンス: 成功時はステータスコード `200`、失敗時は `500`。
 
-## 6. ディレクトリ/主要ファイル
-- `main.py`: Cloud Functionsエントリ、date解釈と子プロセス実行（開始/完了ログ）
+## 5. ディレクトリ/主要ファイル
+- `main.py`: Cloud Functionsエントリポイント。date解釈と`tdnet_cloud.py`をサブプロセスとして実行。
 - `tdnet_cloud.py`: GCS保存、並列処理、メタデータ作成（市場フィルタ、フラット保存対応）
 - `tdnet_base.py`: 共通処理（HTTP, 解析, レート制御, ロギング）
+- `generate_summary.py`: Cloud Runジョブで実行されるサマリー生成スクリプト。
+- `generate_sector_insights.py`: Cloud Runジョブで実行されるインサイト生成スクリプト。
 - `gcs_download.py`: GCSから日付配下をローカルへダウンロードし一覧を出力
 - `constants.py`: 市場除外などの定数/辞書ローダ
 - `analyze_companies.py`: `inputs/companies.csv`から市場の重複排除一覧を出力
 - `config/config.yaml`: 設定（上記スキーマに準拠）
-- `deploy.sh`: デプロイ（requirements差し替え、Scheduler設定、Logging保持72h設定）
+- `deploy.sh`: Cloud Function, Cloud Run ジョブ, Cloud Scheduler等のGCPリソースをデプロイする。
+- `run_manual_batch.sh`: 分析バッチ処理（Cloud Run ジョブ）を手動で実行するスクリプト。
+- `Dockerfile`: Cloud Run ジョブの実行環境となるコンテナイメージを定義する。
 
 ---
 この要件書を満たす実装であれば、同等の機能・運用が可能です。 
-
-## 補遺: 詳細要件・運用手順の総括
-
-## アーキテクチャ
-
-本システムは、Google Cloud Platform上でサーバーレスアーキテクチャを採用しています。
-
-```mermaid
-graph TD
-    A[Cloud Scheduler] -- 毎朝10時 (JST) --> B{Cloud Function: trigger_scraper};
-    subgraph "Task: scrape"
-        B -- task=scrape --> C[tdnet_cloud.py];
-        C -- PDF保存 --> D[GCS: vertex-ai-rag/YYYY/MM/DD/];
-    end
-    subgraph "Task: summary"
-        B -- task=summary --> E[generate_summary.py];
-        E -- PDF読み込み --> D;
-        E -- LLM (Gemini) --> F[Vertex AI];
-        E -- 証券コードごと/統合サマリー保存 --> G[GCS: insights-summaries/YYYYMMDD/];
-    end
-    subgraph "Task: insights"
-        B -- task=insights --> H[generate_sector_insights.py];
-        H -- 統合サマリー読み込み --> G;
-        H -- LLM (Gemini) --> F;
-        H -- 業種インサイト保存 --> I[GCS: insights-sectors/YYYYMMDD/];
-    end
-```
-
-- **Cloud Scheduler**: 毎日定刻にCloud FunctionをHTTPトリガーで起動します。
-- **Cloud Function (`trigger_scraper`)**: システムの単一エントリーポイント。HTTPリクエストの`task`パラメータ (`scrape`, `summary`, `insights`) に応じて、対応するPythonスクリプトをサブプロセスとして実行します。
-- **Google Cloud Storage (GCS)**: スクレイピングしたPDF、生成された証券コードごとの統合サマリー、最終的な業種別インサイトレポートを保存します。
-- **Vertex AI Gemini 2.5 Flash Lite**: PDFテキストから個別企業サマリーとセクター別インサイトを生成するLLMエンジン。
-
-### 処理フロー
-
-処理は以下の3つの独立したタスクに分かれています。
-
-1.  **PDFスクレイピング (`task=scrape`)**:
-    - **自動実行**: 日付指定なし → 当日のJST日付を自動取得
-    - **手動実行**: 日付必須 → 指定された日付のみ処理
-    1.  `tdnet_cloud.py`が指定された日付のTDnetをスクレイピング。
-    2.  取得したPDFファイルをGCSの`vertex-ai-rag/YYYY/MM/DD/`に保存。
-
-2.  **統合サマリー生成 (`task=summary`)**:
-    - **実行条件**: 日付必須（指定された日付のみ処理）
-    1.  `generate_summary.py`が指定された日付のPDFをGCSから読み込む。
-    2.  **全文書を証券コードごとにグループ化**し、`inputs/companies.csv`から33業種・規模区分・企業名を取得。
-    3.  各証券コードについて、関連する**全文書（短信, プレゼン資料, その他）のテキストを一つに連結**する。
-    4.  **規模区分に応じてプロンプト自動選択**（大型株: 詳細版、小型株: コンパクト版）。
-    5.  連結したテキストを使い、**Vertex AI Gemini 2.5 Flash Lite（us-central1）**に証券コードごとに1つの統合サマリーをリクエスト（最大10並列）。
-    6.  生成されたサマリーを`insights-summaries/YYYYMMDD/`に`{date}_{sector}_{size}_{code}_summary.md`形式で保存。
-
-3.  **セクターインサイト生成 (`task=insights`)**:
-    - **実行条件**: 日付必須（指定された日付のみ処理）
-    1.  `generate_sector_insights.py`が`insights-summaries/`から指定日付の全統合サマリーを読み込む。
-    2.  ファイル名から**33業種×規模区分でグループ化**（例：サービス業_Small_2）。
-    3.  **4ステップ構造化分析フレームワーク**（企業間比較、勝ち組条件特定、投資戦略構築）でセクターインサイト生成。
-    4.  `insights-sectors/YYYYMMDD/`に`{sector}_{size}_insights.md`形式で保存。
-
-## 出力・メタデータ
-
-- PDF保存: スクレイピングされたPDFファイルは、以下のパス形式でGCSに保存されます。
-  - `gs://{bucket_name}/{base_path}/YYYY/MM/DD/{company_code}_{safe_title}.pdf`
-- **個別サマリー保存**: 各証券コードの統合サマリーは、以下のパス形式でGCSに保存されます。
-  - `gs://{bucket_name}/{base_path}/insights-summaries/YYYYMMDD/{yyyymmdd}_{sector_name}_{size_classification}_{company_code}_summary.md`
-  - 規模区分: Core30, Large70, Mid400, Small_1, Small_2, Unknown
-- **セクターインサイト保存**: 33業種×規模区分ごとに集約されたインサイトは、以下のパス形式でGCSに保存されます。
-  - `gs://{bucket_name}/{base_path}/insights-sectors/YYYYMMDD/{sector_name}_{size_classification}_insights.md`
-- ログ: 全ての処理ログはCloud Loggingに集約され、72時間保持されます。
 
 ## セキュリティ・IAM
 - **アクセス制限**: Cloud Functions は `internal-only` + 認証必須設定
 - **実行方法**: Cloud Scheduler経由のみ（外部からの直接アクセス不可）
 - **セキュリティ設定**: `--ingress-settings=internal-only --no-allow-unauthenticated`
-- 実行SA: `${PROJECT_NUMBER}-compute@developer.gserviceaccount.com`
-- 付与ロール（バケット）: `roles/storage.objectCreator`（必要に応じて `objectViewer`）
+- **実行SA**: デプロイ時に`deploy.sh`が適切なサービスアカウントと権限を自動設定
 - 本番は鍵不要（ADC）。ローカルは `GOOGLE_APPLICATION_CREDENTIALS=keys/<YOUR_SA_KEY>.json`
 
 ## Scheduler管理
-- 既定: `0 9 * * *`（JST）
+- 既定: `0 19 * * *`（JST 19:00）
 - 変更方法: `deploy.sh`で統合デプロイ（`deploy.env`で設定変更可能）
 
 ## 既知の注意点

@@ -1,131 +1,116 @@
 # Get Started (Zero-to-Run on Google Cloud)
 
-この手順は「新規プロジェクト作成直後」から、本システム（Cloud Scheduler → Cloud Functions → GCS）を動かすまでを網羅します。
+この手順は「新規プロジェクト作成直後」から、本システム（Cloud Scheduler, Cloud Function, Cloud Run ジョブ）をGoogle Cloud上にデプロイし、実行するまでを網羅します。
 
 ## 0. 前提
-- macOS/Linux で `gcloud`/`gsutil` が使えること（Google Cloud SDK インストール済み）
-- プロジェクトID: `YOUR_PROJECT_ID`
-- リージョン: `asia-northeast1`（変更可）
+- macOS/Linux で `gcloud` コマンドが使えること（Google Cloud SDK インストール済み）
+- Google Cloud プロジェクトが作成済みであること
+- 課金が有効になっていること
+- ローカルに `git` がインストールされており、このリポジトリをクローン済みであること
+
+## 1. Google Cloud プロジェクト設定
+ローカルの `gcloud` コマンドラインツールに、対象のプロジェクトIDを設定します。
 
 ```bash
-PROJECT_ID=YOUR_PROJECT_ID
-REGION=asia-northeast1
-BUCKET_NAME=tdnet-documents   # 変更可（グローバル一意）
+# YOUR_PROJECT_ID を実際のプロジェクトIDに置き換えてください
+gcloud config set project YOUR_PROJECT_ID
 ```
 
-## 1) API 有効化
-```bash
-gcloud config set project $PROJECT_ID
-gcloud services enable \
-  cloudfunctions.googleapis.com \
-  run.googleapis.com \
-  cloudscheduler.googleapis.com \
-  cloudbuild.googleapis.com \
-  artifactregistry.googleapis.com \
-  logging.googleapis.com \
-  storage.googleapis.com
-```
+## 2. APIの有効化
+`deploy.sh`スクリプトが、デプロイプロセスの一部として必要なAPI（Cloud Functions, Cloud Run, Cloud Schedulerなど）を自動で有効化します。手動での操作は不要です。
 
-## 2) GCS バケット作成（成果物格納）
+## 3. GCSバケットの作成
+成果物（PDF、サマリー、インサイト）を保存するためのGoogle Cloud Storage (GCS) バケットを作成します。
+
 ```bash
+# BUCKET_NAMEはグローバルで一意な名前にする必要があります
+# REGIONはasia-northeast1（東京）を推奨します
+BUCKET_NAME="tdnet-analyzer-$(gcloud config get-value project)"
+REGION="asia-northeast1"
+
 gsutil mb -l $REGION gs://$BUCKET_NAME
 ```
+> **Note**: `deploy.env` ファイルで `TDNET_BUCKET_NAME` を設定することで、スクリプトが使用するバケット名を指定できます。
 
-## 3) IAM 権限（実行サービスアカウント → GCS 書き込み）
-Cloud Functions Gen2 の実体は Cloud Run で動作し、デフォルトでは「Compute Default Service Account」
-`$PROJECT_NUMBER-compute@developer.gserviceaccount.com` が実行に使われます。
+## 4. サービスアカウントと権限設定
+`deploy.sh`スクリプトが、デプロイ時に必要なサービスアカウントの作成と、IAM権限の付与を自動で行います。手動での操作は基本的に不要です。
 
-- プロジェクト番号取得
-```bash
-PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')
-echo $PROJECT_NUMBER
-```
+スクリプトは `tdnet-analyzer-sa` という表示名のサービスアカウントを探し、存在しない場合は作成します。そして、そのサービスアカウントに必要なロール（Cloud Functions起動元、Cloud Run起動元、GCS書き込み権限など）を付与します。
 
-- バケットへの書き込み権限付与（最小権限）
-```bash
-gsutil iam ch \
-  serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com:roles/storage.objectCreator \
-  gs://$BUCKET_NAME
-```
+## 5. デプロイ
+リポジトリのルートディレクトリで `deploy.sh` を実行します。このスクリプトが、すべてのGoogle Cloudリソース（Cloud Function, Cloud Run ジョブ, Cloud Scheduler）のデプロイと設定を自動で行います。
 
-（必要に応じて読み取りも）
-```bash
-gsutil iam ch \
-  serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com:roles/storage.objectViewer \
-  gs://$BUCKET_NAME
-```
-
-補足:
-- 関数URLを「認証不要（--allow-unauthenticated）」で公開するため、Scheduler側の追加権限は不要です。
-- 認証必須にする場合は、Scheduler実行SAへ Cloud Functions Invoker を付与してください。
-
-## 4) ロギング保持期間（72時間=3日）
-```bash
-gcloud logging buckets update _Default --location=global --retention-days=3 || true
-```
-
-## 5) デプロイ（本リポジトリ直下で実行）
-
-**重要**: Cloud Functionsは`internal-only` + 認証必須でデプロイされます（外部アクセス不可）
+**重要**: スクリプトの初回実行時には、ローカル環境の認証情報を使ってGCPリソースを作成するため、ご自身のユーザーアカウントに十分な権限（プロジェクト編集者など）があることを確認してください。
 
 ```bash
+# スクリプトに実行権限を付与（初回のみ）
+chmod +x deploy.sh run_manual_batch.sh
+
+# デプロイスクリプトを実行
 ./deploy.sh
 ```
-- 反映される設定
-  - Functions: timeout=1500s, memory=1024MB, max-instances=1, HTTP
-  - **セキュリティ**: `internal-only` + 認証必須（外部アクセス不可）
-  - Scheduler: JST 19:00 に毎日実行
-  - Logging: 保持3日
+これにより、以下のリソースが構築され、日次のPDF自動収集が有効になります。
+- **Cloud Function**: `tdnet-scraper`
+- **Cloud Run ジョブ**: `tdnet-summary-generator`, `tdnet-insight-generator`
+- **Cloud Scheduler**: `tdnet-scraper-daily-trigger` (毎日19時 JST)
 
-## 6) 動作確認
+## 6. 動作確認
 
-**注意**: Cloud Functionsは`internal-only`設定のため、以下のHTTPアクセスは失敗します。
+### 日次スクレイピングのテスト実行
+デプロイされたCloud Schedulerジョブを手動で実行することで、日次のスクレイピング機能が正しく動作するかを確認できます。
 
-- 当日（JST）実行（参考）
 ```bash
-FUNCTION_URL=$(gcloud functions describe tdnet-scraper --region=$REGION --gen2 --format='value(serviceConfig.uri)')
-curl -X POST "$FUNCTION_URL/"  # 404エラー（正常）
+gcloud scheduler jobs run tdnet-scraper-daily-trigger --location $REGION
 ```
 
-**実際の動作確認**:
+### 分析バッチのテスト実行
+`run_manual_batch.sh` を使って、指定した期間の分析バッチ処理を手動で実行します。
+
 ```bash
-# Cloud Scheduler経由で実行
-gcloud scheduler jobs run tdnet-scrape-daily --location=asia-northeast1
-```
-- ログ確認
-```bash
-gcloud functions logs read tdnet-scraper --region=$REGION --gen2 --limit=100
+# 2023年1月1日から1月1日までのデータを対象に分析バッチを実行する例
+./run_manual_batch.sh --start-date 20230101 --end-date 20230101
 ```
 
-## 7) ローカルでの検証（任意）
-- 認証（サービスアカウント鍵を用意）
-```bash
-export GOOGLE_APPLICATION_CREDENTIALS="keys/<YOUR_SERVICE_ACCOUNT_KEY>.json"
-```
-- 依存インストール
-```bash
-pip install -r requirements.txt
-```
-- ローカル実行（日付必須）
-```bash
-# スクレイピング実行
-python tdnet_cloud.py --date 20250807
+### ログ確認
+各処理のログはGoogle Cloud Loggingで確認できます。
 
-# GCS→ローカル ダウンロード
-python gcs_download.py --date 20250807 --out downloads
+```bash
+# Cloud Function (スクレイパー) のログ
+gcloud functions logs read tdnet-scraper --region=$REGION --gen2 --limit=50
 
-# LLM処理（個別サマリー）
-python generate_summary.py --date 20250807 --project <YOUR_PROJECT_ID>
+# Cloud Run ジョブ (サマリー生成) のログ
+gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=tdnet-summary-generator" --limit=50
 
-# LLM処理（セクターインサイト）
-python generate_sector_insights.py --date 20250807 --project <YOUR_PROJECT_ID>
+# Cloud Run ジョブ (インサイト生成) のログ
+gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=tdnet-insight-generator" --limit=50
 ```
+
+## 7. ローカルでの検証（任意）
+個別のスクリプトをローカル環境で実行することも可能です。
+
+- **認証設定**:
+  `gcloud` CLI経由でアプリケーションのデフォルト認証情報を設定します。
+  ```bash
+  gcloud auth application-default login
+  ```
+
+- **依存インストール**:
+  ```bash
+  pip install -r requirements.txt
+  ```
+
+- **ローカル実行例**:
+  ```bash
+  # スクレイピング実行
+  python tdnet_cloud.py --date 20230101
+
+  # 個別サマリー生成
+  python generate_summary.py --start-date 20230101 --end-date 20230101
+
+  # セクターインサイト生成
+  python generate_sector_insights.py --start-date 20230101 --end-date 20230101
+  ```
 
 ## トラブルシュート（IAM）
-- アップロード 403: 実行SA（`${PROJECT_NUMBER}-compute@developer.gserviceaccount.com`）に
-  `roles/storage.objectCreator` が付与されているか確認
-- Function起動不可（認証関連）: 今回は `--allow-unauthenticated`。制限したい場合は `Cloud Functions Invoker` を適切なSAへ付与
-
-## 補足（セキュリティ）
-- ローカル鍵はリポジトリにコミットしない（`.gitignore` で除外済み）
-- 本番は鍵不要（ADCで自動認証） 
+- **デプロイ時の権限エラー**: `deploy.sh`を実行するユーザーアカウントに、プロジェクトに対する十分な権限（例: `roles/editor`）があることを確認してください。
+- **実行時の権限エラー**: `tdnet-analyzer-sa`サービスアカウントに、必要なロール（`roles/storage.objectAdmin`, `roles/run.invoker`など）が付与されているか、GCPコンソールのIAMページで確認してください。`deploy.sh`がこれらの権限を自動で設定します。 

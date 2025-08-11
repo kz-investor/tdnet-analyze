@@ -6,12 +6,16 @@ import argparse
 import os
 import sys
 import tempfile
+import datetime
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from collections import defaultdict
 
 import yaml
 from google.cloud import storage
+import google.auth
+import google.auth.transport.requests
+import requests
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
@@ -63,9 +67,9 @@ except Exception as e:
 
 # 定数
 DEFAULT_BUCKET = os.environ.get('TDNET_BUCKET', CONFIG.get('gcs', {}).get('bucket_name', 'tdnet-documents'))
-DEFAULT_BASE = os.environ.get('TDNET_BASE', CONFIG.get('gcs', {}).get('base_path', 'vertex-ai-rag'))
+DEFAULT_BASE = os.environ.get('TDNET_BASE', CONFIG.get('gcs', {}).get('base_path', 'tdnet-analyzer'))
 DEFAULT_LOCATION = "us-central1"
-DEFAULT_MODEL = CONFIG.get('llm', {}).get('model_name', 'gemini-2.5-flash-lite')
+DEFAULT_MODEL = CONFIG.get('llm', {}).get('model_name', 'gemini-1.0-pro')
 DEFAULT_MAX_WORKERS = CONFIG.get('llm', {}).get('parallel', {}).get('max_workers', 10)
 
 # プロンプトの読み込み
@@ -125,7 +129,8 @@ def load_metadata(client: storage.Client, bucket: str, base: str, date_str: str)
     return json.loads(data.decode("utf-8"))
 
 
-def _extract_text_with_fitz(path: str) -> str:
+def _extract_text_with_fitz(path: str) -> Optional[str]:
+    """PyMuPDF(fitz)を使用してテキストを抽出する。失敗した場合はNoneを返す。"""
     try:
         with fitz.open(path) as doc:
             texts: List[str] = []
@@ -135,8 +140,9 @@ def _extract_text_with_fitz(path: str) -> str:
                 except Exception:
                     continue
             return "\n".join(texts)
-    except Exception:
-        return ""
+    except Exception as e:
+        logger.warning(f"PyMuPDF(fitz)でのテキスト抽出に失敗: {e}。pypdfにフォールバックします。")
+        return None
 
 
 def _extract_text_with_pypdf(path: str) -> str:
@@ -155,12 +161,18 @@ def _extract_text_with_pypdf(path: str) -> str:
 
 
 def extract_text_from_pdf_file(path: str) -> str:
+    """PDFからテキストを抽出する。fitzを優先し、失敗した場合のみpypdfにフォールバックする。"""
     if FITZ_AVAILABLE:
-        txt = _extract_text_with_fitz(path)
-        if txt:
-            return txt
+        # fitzはより堅牢なため、まず試す
+        text = _extract_text_with_fitz(path)
+        if text is not None:
+            # fitzが処理できた場合（空文字列を含む）、その結果を返す
+            return text
+
+    # fitzが利用不可、または処理に失敗した場合のみpypdfを試す
     if PDF_AVAILABLE:
         return _extract_text_with_pypdf(path)
+
     return ""
 
 
@@ -227,19 +239,40 @@ def build_docs_from_local(local_dir: str, include: Optional[str] = None, codes: 
     return docs
 
 
-def generate_summaries_for_date(date_str: str, bucket: str = DEFAULT_BUCKET, base: str = DEFAULT_BASE,
-                                project: Optional[str] = None, location: str = DEFAULT_LOCATION,
-                                model_name: str = DEFAULT_MODEL,
-                                local_dir: Optional[str] = None, include: Optional[str] = None,
-                                codes: Optional[List[str]] = None, max_files: Optional[int] = None) -> List[str]:
+def generate_summaries(dates: List[str], bucket: str = DEFAULT_BUCKET, base: str = DEFAULT_BASE,
+                       project: Optional[str] = None, location: str = DEFAULT_LOCATION,
+                       model_name: str = DEFAULT_MODEL,
+                       local_dir: Optional[str] = None, include: Optional[str] = None,
+                       codes: Optional[List[str]] = None, max_files: Optional[int] = None) -> List[str]:
     """特定の日付の開示文書からインサイトを生成する。証券コードごとに資料をまとめて要約。"""
-    logger.info(f"インサイト生成開始: 日付={date_str}, バケット={bucket}, ベースパス={base}, プロジェクト={project or '未指定'}, ロケーション={location}, モデル={model_name}")
+    output_date_str = dates[-1] if dates else datetime.datetime.now().strftime("%Y%m%d")
+    logger.info(
+        f"インサイト生成開始: 期間={dates[0] if dates else 'N/A'}-{dates[-1] if dates else 'N/A'}, バケット={bucket}, ベースパス={base}, プロジェクト={project or '未指定'}, ロケーション={location}, モデル={model_name}")
 
     if not project:
         logger.error("Google Cloud Project IDが指定されていません。--project オプションで指定するか、環境変数 GOOGLE_CLOUD_PROJECT を設定してください。")
         return []
 
-    client = storage.Client()
+    # --- GCSクライアントのカスタマイズ ---
+    # 多数の並列処理に対応するため、接続プールサイズを増やす
+    try:
+        credentials, project_id_from_auth = google.auth.default()
+        # 引数で渡されたprojectを優先する
+        final_project_id = project or project_id_from_auth
+
+        # requests.Session をカスタマイズ
+        adapter = requests.adapters.HTTPAdapter(pool_connections=DEFAULT_MAX_WORKERS, pool_maxsize=DEFAULT_MAX_WORKERS)
+        session = requests.Session()
+        session.mount('https://', adapter)
+
+        # カスタマイズしたセッションで認証済みセッションを作成
+        authed_session = google.auth.transport.requests.AuthorizedSession(credentials, session=session)
+
+        client = storage.Client(project=final_project_id, credentials=credentials, _http=authed_session)
+        logger.info(f"GCSクライアントをカスタマイズしました。プロジェクト: {final_project_id}, 接続プールサイズ: {DEFAULT_MAX_WORKERS}")
+    except Exception as e:
+        logger.warning(f"GCSクライアントのカスタマイズに失敗しました。デフォルト設定で続行します。エラー: {e}")
+        client = storage.Client(project=project)
 
     company_info_map: Dict[str, tuple[str, str, str]] = {}
     try:
@@ -255,7 +288,12 @@ def generate_summaries_for_date(date_str: str, bucket: str = DEFAULT_BUCKET, bas
         all_docs = build_docs_from_local(local_dir, include, codes, max_files)
         logger.info(f"ローカルディレクトリ {local_dir} から {len(all_docs)} 件の文書をロードしました。")
     else:
-        all_docs = build_docs_from_metadata(load_metadata(client, bucket, base, date_str))
+        all_docs = []
+        for date_str in dates:
+            try:
+                all_docs.extend(build_docs_from_metadata(load_metadata(client, bucket, base, date_str)))
+            except Exception as e:
+                logger.warning(f"メタデータの読み込みに失敗しました(date={date_str}): {e}")
         log_info(f"GCSメタデータから {len(all_docs)} 件の文書をロードしました。")
 
     # 2. 証券コードでグループ化（33業種+規模区分）
@@ -341,8 +379,8 @@ def generate_summaries_for_date(date_str: str, bucket: str = DEFAULT_BUCKET, bas
                 print(f"INFO: ({processed_groups_count}/{total_groups}) 要約成功: コード={group.code}")
                 logger.info(f"({processed_groups_count}/{total_groups}) 要約成功: コード={group.code}")
 
-                summary_filename = f"{date_str}_{safe_name(group.sector)}_{safe_name(group.size)}_{group.code}_summary.md"
-                summary_gcs_path = f"{base}/insights-summaries/{date_str}/{summary_filename}"
+                summary_filename = f"{output_date_str}__{safe_name(group.sector)}__{safe_name(group.size)}__{group.code}__{safe_name(group.name)}_summary.md"
+                summary_gcs_path = f"{base}/insights-summaries/{output_date_str}/{summary_filename}"
 
                 try:
                     blob = client.bucket(bucket).blob(summary_gcs_path)
@@ -379,10 +417,19 @@ def extract_texts_for_group(group: DocumentGroup, client: storage.Client, bucket
     return "\n\n".join(combined_texts)
 
 
+def get_date_range(start_date_str: str, end_date_str: str) -> List[str]:
+    """YYYYMMDD形式の開始日と終了日から日付文字列のリストを生成する"""
+    start_date = datetime.datetime.strptime(start_date_str, "%Y%m%d")
+    end_date = datetime.datetime.strptime(end_date_str, "%Y%m%d")
+    delta = end_date - start_date
+    return [(start_date + datetime.timedelta(days=i)).strftime("%Y%m%d") for i in range(delta.days + 1)]
+
+
 def main():
     log_info("generate_summary.py スクリプト開始")
     parser = argparse.ArgumentParser(description="Generate company-level summaries from TDnet documents.")
-    parser.add_argument('--date', required=True, help='Target date in YYYYMMDD format.')
+    parser.add_argument('--start-date', required=True, help='Target start date in YYYYMMDD format.')
+    parser.add_argument('--end-date', required=True, help='Target end date in YYYYMMDD format.')
     parser.add_argument('--bucket', default=DEFAULT_BUCKET, help='GCS bucket name.')
     parser.add_argument('--base', default=DEFAULT_BASE, help='GCS base path.')
     parser.add_argument('--project', default=os.environ.get('GOOGLE_CLOUD_PROJECT'), help='Google Cloud Project ID.')
@@ -396,10 +443,11 @@ def main():
     args = parser.parse_args()
 
     codes_list = args.codes.split(',') if args.codes else None
+    dates_to_process = get_date_range(args.start_date, args.end_date)
 
     try:
-        generate_summaries_for_date(
-            date_str=args.date,
+        generate_summaries(
+            dates=dates_to_process,
             bucket=args.bucket,
             base=args.base,
             project=args.project,

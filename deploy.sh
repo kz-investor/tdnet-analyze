@@ -1,102 +1,137 @@
 #!/bin/bash
-
-# Cloud Functions Deployment Script
-# 重要: internal-only + 認証必須でデプロイ（外部アクセス不可）
+#
+# TDnet分析基盤 デプロイメントスクリプト
+# - Cloud Function (日次スクレイピング)
+# - Cloud Run ジョブ (期間指定バッチ処理)
+#
 set -e
 
-# 一時差し替え用のトラップ設定（終了時に必ず復元）
-ORIG_REQ="requirements.txt"
-BACKUP_REQ="requirements.local.bak"
-RESTORE() {
-  if [ -f "$BACKUP_REQ" ]; then
-    mv -f "$BACKUP_REQ" "$ORIG_REQ"
-  fi
-}
-trap RESTORE EXIT
-
-# --- 設定 ---
-# 環境変数設定を読み込み
-source deploy.env
-
-# Cloud Functions
-FUNCTION_NAME="tdnet-scraper" # スクレイピング用
-REGION="${TDNET_REGION}"
-MEMORY="${TDNET_MEMORY}"
-TIMEOUT="${TDNET_TIMEOUT}"
-MAX_INSTANCES="${TDNET_MAX_INSTANCES}"
-
-# Cloud Scheduler
-PROJECT_ID=$(gcloud config get-value project)
-SERVICE_ACCOUNT="${PROJECT_ID}@appspot.gserviceaccount.com" # デフォルトのApp Engine SA
-JOB_NAME="tdnet-scrape-daily"
-CRON="0 19 * * *"  # 毎日19:00 JST
-TIME_ZONE="Asia/Tokyo"
-
-# --- スクリプト本体 ---
-echo "Cloud Functions (${FUNCTION_NAME}) のデプロイを開始します..."
-
-# ログ保持期間の更新
-set +e
-gcloud logging buckets update _Default --location=global --retention-days=3 2>/dev/null
-set -e
-
-# 依存関係ファイルを一時的に切り替え
-if [ -f "requirements.txt" ] && [ -f "requirements-functions.txt" ]; then
-    mv requirements.txt requirements.txt.bak
-    mv requirements-functions.txt requirements.txt
+# --- 認証設定 ---
+if [ -z "$1" ]; then
+    echo "❌ エラー: サービスアカウントキーファイルのパスを引数として指定してください。"
+    echo "   使用法: ./deploy.sh keys/your-service-account-key.json"
+    exit 1
+fi
+SERVICE_ACCOUNT_KEY_FILE="$1"
+if [ ! -f "${SERVICE_ACCOUNT_KEY_FILE}" ]; then
+    echo "❌ エラー: サービスアカウントキーファイルが見つかりません: ${SERVICE_ACCOUNT_KEY_FILE}"
+    exit 1
 fi
 
-# gcloud deploy コマンド
-gcloud functions deploy "${FUNCTION_NAME}" \
+echo "🔑 サービスアカウント (${SERVICE_ACCOUNT_KEY_FILE}) を使用して認証します..."
+gcloud auth activate-service-account --key-file="${SERVICE_ACCOUNT_KEY_FILE}"
+PROJECT_ID=$(gcloud config get-value project)
+echo "✅ 認証完了。プロジェクト: ${PROJECT_ID}"
+
+# --- 設定 ---
+source deploy.env
+REGION="${TDNET_REGION:-"asia-northeast1"}" # デフォルトは東京リージョン
+SERVICE_ACCOUNT_EMAIL="${TDNET_SERVICE_ACCOUNT:-$(gcloud iam service-accounts list --filter="displayName=tdnet-analyzer-sa" --format="value(email)")}"
+
+# --- リソース名 ---
+# Cloud Function
+CF_SCRAPER_NAME="tdnet-scraper"
+# Cloud Scheduler
+SCHEDULER_JOB_NAME="tdnet-scraper-daily-trigger"
+# Artifact Registry
+AR_REPO_NAME="tdnet-analyzer-repo"
+# Cloud Run Jobs
+CR_SUMMARY_JOB_NAME="tdnet-summary-generator"
+CR_INSIGHT_JOB_NAME="tdnet-insight-generator"
+
+IMAGE_NAME="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO_NAME}/tdnet-analyzer:latest"
+
+
+# --- APIサービスの有効化 ---
+echo "🔄 必要なAPIサービスを有効化しています (cloudfunctions, cloudbuild, cloudscheduler, artifactregistry, run)..."
+gcloud services enable cloudfunctions.googleapis.com cloudbuild.googleapis.com cloudscheduler.googleapis.com artifactregistry.googleapis.com run.googleapis.com --project "${PROJECT_ID}"
+
+
+# --- セクション1: Cloud Function (日次スクレイピング) ---
+echo -e "\n--- セクション1: Cloud Function (日次スクレイピング) のデプロイを開始 ---"
+
+gcloud functions deploy "${CF_SCRAPER_NAME}" \
   --gen2 \
   --region "${REGION}" \
   --runtime python311 \
   --source . \
   --entry-point trigger_scraper \
   --trigger-http \
-  --ingress-settings=internal-only \
   --no-allow-unauthenticated \
-  --memory "${MEMORY}" \
-  --timeout "${TIMEOUT}" \
-  --max-instances "${MAX_INSTANCES}" \
-  --set-env-vars "PROJECT_ID=${PROJECT_ID},REGION=${REGION},LOG_EXECUTION_ID=true"
+  --memory "1Gi" \
+  --timeout "540s" \
+  --set-env-vars "PROJECT_ID=${PROJECT_ID}" \
+  --service-account "${SERVICE_ACCOUNT_EMAIL}"
 
-# 依存関係ファイルを元に戻す
-if [ -f "requirements.txt.bak" ]; then
-    mv requirements.txt requirements-functions.txt
-    mv requirements.txt.bak requirements.txt
-fi
+CF_URL=$(gcloud functions describe "${CF_SCRAPER_NAME}" --region "${REGION}" --gen2 --format='value(serviceConfig.uri)')
+echo "✅ Cloud Function (${CF_SCRAPER_NAME}) のデプロイ完了。"
 
-FUNCTION_URL=$(gcloud functions describe "${FUNCTION_NAME}" --region "${REGION}" --gen2 --format='value(serviceConfig.uri)')
 
-echo "Cloud Functions (${FUNCTION_NAME}) のデプロイが完了しました。"
-echo "関数URL: ${FUNCTION_URL}"
+# --- セクション2: Cloud Scheduler (日次実行トリガー) ---
+echo -e "\n--- セクション2: Cloud Scheduler ジョブの作成/更新を開始 ---"
 
-# --- Cloud Scheduler ジョブ (Scrape) ---
-echo "Cloud Schedulerジョブ (${JOB_NAME}) を作成/更新します..."
-
-# Cloud Schedulerジョブの作成または更新
-if gcloud scheduler jobs describe "${JOB_NAME}" --location "${REGION}" &>/dev/null; then
-  echo "既存のCloud Schedulerジョブを更新します..."
-  gcloud scheduler jobs update http "${JOB_NAME}" \
+gcloud scheduler jobs create http "${SCHEDULER_JOB_NAME}" \
     --location "${REGION}" \
-    --schedule="${CRON}" \
-    --uri="${FUNCTION_URL}" \
-    --message-body='{"task":"scrape"}' \
-    --update-headers='Content-Type=application/json' \
-    --description="Trigger TDnet Scraper daily at 19:00 JST"
-else
-  echo "新しいCloud Schedulerジョブを作成します..."
-  gcloud scheduler jobs create http "${JOB_NAME}" \
-    --location "${REGION}" \
-    --schedule="${CRON}" \
-    --time-zone="${TIME_ZONE}" \
-    --uri="${FUNCTION_URL}" \
+    --schedule="0 19 * * *" \
+    --time-zone="Asia/Tokyo" \
+    --uri="${CF_URL}" \
     --http-method=POST \
-    --message-body='{"task":"scrape"}' \
-    --headers='Content-Type=application/json' \
     --description="Trigger TDnet Scraper daily at 19:00 JST" \
-    --oidc-service-account-email="${SERVICE_ACCOUNT}"
+    --oidc-service-account-email="${SERVICE_ACCOUNT_EMAIL}" \
+    --attempt-deadline="320s" \
+    || \
+gcloud scheduler jobs update http "${SCHEDULER_JOB_NAME}" \
+    --location "${REGION}" \
+    --schedule="0 19 * * *" \
+    --uri="${CF_URL}" \
+    --description="Trigger TDnet Scraper daily at 19:00 JST"
+
+echo "✅ Cloud Scheduler (${SCHEDULER_JOB_NAME}) の設定完了。"
+
+
+# --- セクション3: Cloud Run ジョブ (期間指定バッチ) ---
+echo -e "\n--- セクション3: Cloud Run ジョブのデプロイを開始 ---"
+
+# 3a. Artifact Registry リポジトリの作成
+echo "--- Artifact Registry リポジトリの確認/作成 ---"
+if ! gcloud artifacts repositories describe "${AR_REPO_NAME}" --location="${REGION}" --project="${PROJECT_ID}" &>/dev/null; then
+    echo "Artifact Registryリポジトリ ${AR_REPO_NAME} を作成します..."
+    gcloud artifacts repositories create "${AR_REPO_NAME}" \
+        --repository-format=docker \
+        --location="${REGION}" \
+        --description="TDnet Analyzer container images" \
+        --project="${PROJECT_ID}"
+else
+    echo "Artifact Registryリポジトリ ${AR_REPO_NAME} は既に存在します。"
 fi
 
-echo "Cloud Schedulerジョブ (${JOB_NAME}) の設定が完了しました。" 
+# 3b. Dockerイメージのビルドとプッシュ
+echo "--- Dockerイメージのビルドとプッシュ ---"
+gcloud builds submit --tag "${IMAGE_NAME}" --project "${PROJECT_ID}"
+
+# 3c. Cloud Run ジョブのデプロイ
+COMMON_JOB_FLAGS=(
+  --region "${REGION}"
+  --service-account "${SERVICE_ACCOUNT_EMAIL}"
+  --image "${IMAGE_NAME}"
+  --tasks 1
+  --task-timeout 3600
+  --cpu "${CR_CPU:-1}"
+  --memory "${CR_MEMORY:-2Gi}"
+)
+echo "--- Summary Generator ジョブのデプロイ (CPU: ${CR_CPU:-1}, Memory: ${CR_MEMORY:-2Gi}) ---"
+gcloud run jobs deploy "${CR_SUMMARY_JOB_NAME}" \
+  "${COMMON_JOB_FLAGS[@]}" \
+  --command "python3" \
+  --args "generate_summary.py" \
+  --project "${PROJECT_ID}"
+
+echo "--- Insight Generator ジョブのデプロイ (CPU: ${CR_CPU:-1}, Memory: ${CR_MEMORY:-2Gi}) ---"
+gcloud run jobs deploy "${CR_INSIGHT_JOB_NAME}" \
+  "${COMMON_JOB_FLAGS[@]}" \
+  --command "python3" \
+  --args "generate_sector_insights.py" \
+  --project "${PROJECT_ID}"
+
+echo "✅ Cloud Run ジョブのデプロイ完了。"
+echo -e "\n🎉🎉🎉 すべてのデプロイ処理が正常に完了しました。 🎉🎉🎉" 

@@ -55,8 +55,10 @@ save:
 
 # GCS設定
 gcs:
+  # GCSバケット名
   bucket_name: "tdnet-documents"
-  base_path: "vertex-ai-rag"
+  # GCS内のベースパス
+  base_path: "tdnet-analyzer"      # 必須
   # 1日配下をフラットに保存したい場合はtrue
   flat_per_day: true
 

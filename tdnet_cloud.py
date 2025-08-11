@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-適時開示データ取得システム - Google Cloud版
-日本株の適時開示サービスからデータを取得して、GCSにアップロードし、Vertex AI RAG用のフォルダ構造を作成
+日本株の適時開示サービスからデータを取得して、GCSにアップロードし、
+TDnetデータ処理パイプライン用のフォルダ構造を作成
 """
 
 import os
@@ -16,6 +16,10 @@ import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import functions_framework
 import re
+
+import google.auth
+import google.auth.transport.requests
+import requests
 
 from tdnet_base import TDNetBase
 # 市場フィルタ用
@@ -93,15 +97,34 @@ class TDNetCloud(TDNetBase):
         """初期化"""
         super().__init__(config_path, use_multithread)
 
-        # GCSクライアントの初期化
-        self.storage_client = storage.Client()
+        # --- GCSクライアントのカスタマイズ ---
+        try:
+            credentials, project_id = google.auth.default()
+
+            # 並列数に応じて接続プールサイズをカスタマイズ
+            adapter = requests.adapters.HTTPAdapter(pool_connections=self.max_workers, pool_maxsize=self.max_workers)
+            session = requests.Session()
+            session.mount('https://', adapter)
+
+            authed_session = google.auth.transport.requests.AuthorizedSession(credentials, session=session)
+
+            self.storage_client = storage.Client(project=project_id, credentials=credentials, _http=authed_session)
+            self.logger.info(f"GCSクライアントをカスタマイズしました。プロジェクト: {project_id}, 接続プールサイズ: {self.max_workers}")
+        except Exception as e:
+            self.logger.warning(f"GCSクライアントのカスタマイズに失敗。デフォルト設定で続行します。エラー: {e}")
+            # フォールバック時もプロジェクトIDを指定する
+            try:
+                credentials, project_id = google.auth.default()
+                self.storage_client = storage.Client(project=project_id)
+            except Exception:
+                self.storage_client = storage.Client(project=os.environ.get("PROJECT_ID"))
 
         # GCSクライアントのみ使用
 
         # 設定からGCS設定を読み込み
         gcs_config = self.config.get('gcs', {})
         self.bucket_name = gcs_config.get('bucket_name')
-        self.base_path = gcs_config.get('base_path', 'tdnet_data')
+        self.base_path = gcs_config.get('base_path', 'tdnet-analyzer')
         # doc_type強制（例: "tanshin"）。未設定なら分類結果を使用
         self.force_doc_type = gcs_config.get('force_doc_type')
         # フラット保存設定

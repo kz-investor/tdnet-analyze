@@ -5,6 +5,7 @@ import re
 import argparse
 import os
 import sys
+import datetime
 from collections import defaultdict
 import yaml
 
@@ -31,9 +32,9 @@ except Exception as e:
 
 # 定数
 DEFAULT_BUCKET = os.environ.get('TDNET_BUCKET', CONFIG.get('gcs', {}).get('bucket_name', 'tdnet-documents'))
-DEFAULT_BASE = os.environ.get('TDNET_BASE', CONFIG.get('gcs', {}).get('base_path', 'vertex-ai-rag'))
+DEFAULT_BASE = os.environ.get('TDNET_BASE', CONFIG.get('gcs', {}).get('base_path', 'tdnet-analyzer'))
 DEFAULT_LOCATION = "us-central1"
-DEFAULT_MODEL = CONFIG.get('llm', {}).get('model_name', 'gemini-2.5-flash-lite')
+DEFAULT_MODEL = CONFIG.get('llm', {}).get('model_name', 'gemini-1.0-pro')
 DEFAULT_MAX_WORKERS = CONFIG.get('llm', {}).get('parallel', {}).get('max_workers', 10)
 
 # プロンプトの読み込み
@@ -65,35 +66,57 @@ def safe_name(name: str, max_len: int = 50) -> str:
     return s.strip().replace(" ", "_")[:max_len]
 
 
-def generate_sector_insights_for_date(date_str: str, bucket: str, base: str, project: str, location: str, model_name: str):
-    logger.info(f"業種インサイト生成開始: 日付={date_str}, バケット={bucket}, ベースパス={base}")
+def get_date_range(start_date_str: str, end_date_str: str) -> list[str]:
+    """YYYYMMDD形式の開始日と終了日から日付文字列のリストを生成する"""
+    import datetime
+    start_date = datetime.datetime.strptime(start_date_str, "%Y%m%d")
+    end_date = datetime.datetime.strptime(end_date_str, "%Y%m%d")
+    delta = end_date - start_date
+    return [(start_date + datetime.timedelta(days=i)).strftime("%Y%m%d") for i in range(delta.days + 1)]
+
+
+def generate_sector_insights(dates: list[str], bucket: str, base: str, project: str, location: str, model_name: str):
+    output_date_str = dates[-1] if dates else datetime.datetime.now().strftime("%Y%m%d")
+    logger.info(f"業種インサイト生成開始: 期間={dates[0] if dates else 'N/A'}-{dates[-1] if dates else 'N/A'}, バケット={bucket}, ベースパス={base}")
 
     client = storage.Client()
     bucket_obj = client.bucket(bucket)
-    prefix = f"{base}/insights-summaries/{date_str}/"
-    blobs = list(client.list_blobs(bucket_obj, prefix=prefix))
-    if not blobs:
-        logger.warning(f"GCSに処理対象の個別サマリーファイルが見つかりません: gs://{bucket}/{prefix}")
+
+    all_blobs = []
+    for date_str in dates:
+        prefix = f"{base}/insights-summaries/{date_str}/"
+        blobs = list(client.list_blobs(bucket_obj, prefix=prefix))
+        if not blobs:
+            logger.warning(f"GCSに処理対象の個別サマリーファイルが見つかりません: gs://{bucket}/{prefix}")
+        all_blobs.extend(blobs)
+
+    if not all_blobs:
+        logger.warning(f"指定された期間に処理対象の個別サマリーファイルが1件も見つかりませんでした。")
         return
 
-    logger.info(f"{len(blobs)}件の個別サマリーをGCSから読み込みます。")
+    logger.info(f"{len(all_blobs)}件の個別サマリーをGCSから読み込みます。")
     sector_docs = defaultdict(list)
-    for blob in blobs:
+    for blob in all_blobs:
         try:
-            # ファイル名から業種+規模区分を抽出 (例: 20250807_サービス業_Small_2_60620_summary.md)
-            parts = blob.name.split('/')[-1].split('_')
-            if len(parts) >= 5:  # 新形式: date_sector_size1_size2_code_summary.md
-                sector = parts[1]
-                size = f"{parts[2]}_{parts[3]}"  # Small_2, Core30 など
-                sector_size_key = f"{sector}_{size}"
-                content = blob.download_as_text()
-                sector_docs[sector_size_key].append(content)
-            elif len(parts) >= 3:  # 旧形式: date_sector_code_summary.md (後方互換性)
-                sector = parts[1]
-                content = blob.download_as_text()
-                sector_docs[sector].append(content)
+            filename = blob.name.split('/')[-1]
+            base_name, ext = os.path.splitext(filename)
+
+            if ext == '.md' and base_name.endswith('_summary'):
+                core_name = base_name[:-len('_summary')]
+                parts = core_name.split('__')
+
+                if len(parts) == 5:
+                    # date, sector, size, code, company_name
+                    sector = parts[1]
+                    size_classification = parts[2]
+                    sector_size_key = f"{sector}_{size_classification}"
+
+                    content = blob.download_as_text()
+                    sector_docs[sector_size_key].append(content)
+                else:
+                    logger.warning(f"ファイル名の形式が不正なため業種・規模を抽出できません: {filename}")
             else:
-                logger.warning(f"ファイル名の形式が不正なため業種を抽出できません: {blob.name}")
+                logger.warning(f"予期しないファイル形式です: {filename}")
         except Exception as e:
             logger.error(f"GCSからのファイル読み込みエラー: {blob.name}, エラー: {e}")
 
@@ -102,22 +125,25 @@ def generate_sector_insights_for_date(date_str: str, bucket: str, base: str, pro
         return
 
     with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as executor:
-        future_to_sector = {
-            executor.submit(
+        future_to_sector = {}
+        for sector_size_key, docs in sector_docs.items():
+            # システムプロンプトとユーザープロンプトの両方で変数を置換する
+            system_prompt = SECTOR_SYSTEM_PROMPT_TEMPLATE.replace("{{sector_name}}", sector_size_key).replace("{{count}}", str(len(docs)))
+            user_prompt = SECTOR_USER_PROMPT_TEMPLATE.replace("{{summaries}}", "\n\n".join(docs))
+
+            future = executor.submit(
                 summarize_text_with_vertex,
                 project, location, model_name,
-                SECTOR_SYSTEM_PROMPT_TEMPLATE,
-                SECTOR_USER_PROMPT_TEMPLATE.replace("{{sector_name}}", sector_size_key).replace(
-                    "{{count}}", str(len(docs))).replace("{{summaries}}", "\n\n".join(docs))
-            ): sector_size_key
-            for sector_size_key, docs in sector_docs.items()
-        }
+                system_prompt,
+                user_prompt
+            )
+            future_to_sector[future] = sector_size_key
 
         for future in as_completed(future_to_sector):
             sector_size_key = future_to_sector[future]
             try:
                 insight_text = future.result()
-                insight_gcs_path = f"{base}/insights-sectors/{date_str}/{safe_name(sector_size_key)}_insights.md"
+                insight_gcs_path = f"{base}/insights-sectors/{output_date_str}/{safe_name(sector_size_key)}_insights.md"
                 blob = client.bucket(bucket).blob(insight_gcs_path)
                 blob.upload_from_string(insight_text.encode('utf-8'), content_type="text/markdown")
                 logger.info(f"セクター+規模インサイトをGCSにアップロードしました: gs://{bucket}/{insight_gcs_path}")
@@ -130,7 +156,8 @@ def generate_sector_insights_for_date(date_str: str, bucket: str, base: str, pro
 def main():
     logger.info("generate_sector_insights.py スクリプト開始")
     parser = argparse.ArgumentParser(description="Generate sector insights from pre-computed summaries.")
-    parser.add_argument('--date', required=True, help='Target date in YYYYMMDD format.')
+    parser.add_argument('--start-date', required=True, help='Target start date in YYYYMMDD format.')
+    parser.add_argument('--end-date', required=True, help='Target end date in YYYYMMDD format.')
     parser.add_argument('--bucket', default=DEFAULT_BUCKET, help='GCS bucket name.')
     parser.add_argument('--base', default=DEFAULT_BASE, help='GCS base path.')
     parser.add_argument('--project', default=os.environ.get('GOOGLE_CLOUD_PROJECT'), help='Google Cloud Project ID.')
@@ -143,9 +170,11 @@ def main():
         logger.error("Google Cloud Project IDが指定されていません。--project オプションで指定するか、環境変数 GOOGLE_CLOUD_PROJECT を設定してください。")
         sys.exit(1)
 
+    dates_to_process = get_date_range(args.start_date, args.end_date)
+
     try:
-        generate_sector_insights_for_date(
-            date_str=args.date,
+        generate_sector_insights(
+            dates=dates_to_process,
             bucket=args.bucket,
             base=args.base,
             project=args.project,
