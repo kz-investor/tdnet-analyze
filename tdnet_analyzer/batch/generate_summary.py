@@ -25,16 +25,16 @@ import time
 import random
 from google.api_core import exceptions
 
-# ロギング設定（Cloud Functions対応）
+from tdnet_analyzer.common.path_utils import project_path
+
+# ロギング設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Cloud Functions用のログ出力関数
-
 
 def log_info(message):
-    print(f"INFO: {message}")  # Cloud Loggingに出力
-    logger.info(message)  # ローカル実行時用
+    print(f"INFO: {message}")
+    logger.info(message)
 
 
 # PDF抽出バックエンド
@@ -53,7 +53,7 @@ except Exception:
 
 # 証券コード正規化
 try:
-    from constants import normalize_code
+    from tdnet_analyzer.common.constants import normalize_code
 except Exception:
     def normalize_code(c: str) -> str:
         return c
@@ -61,7 +61,7 @@ except Exception:
 # --- グローバル設定 ---
 CONFIG = {}
 try:
-    with open("config/config.yaml", "r") as f:
+    with open(project_path('config', 'config.yaml'), "r") as f:
         CONFIG = yaml.safe_load(f)
 except FileNotFoundError:
     logger.warning("config/config.yamlが見つかりません。")
@@ -76,15 +76,13 @@ DEFAULT_MODEL = CONFIG.get('llm', {}).get('model_name', 'gemini-1.0-pro')
 DEFAULT_MAX_WORKERS = CONFIG.get('llm', {}).get('parallel', {}).get('max_workers', 10)
 
 # プロンプトの読み込み
-PROMPT_DIR = os.path.join(os.path.dirname(__file__), 'prompt_templates')
+PROMPT_DIR = project_path('prompt_templates')
 try:
-    # 通常版（大型株用）
-    with open(os.path.join(PROMPT_DIR, 'summary_system_prompt.md'), 'r', encoding='utf-8') as f:
+    with open(PROMPT_DIR / 'summary_system_prompt.md', 'r', encoding='utf-8') as f:
         SUMMARY_SYSTEM_PROMPT_TEMPLATE = f.read()
-    # コンパクト版（小型株用）
-    with open(os.path.join(PROMPT_DIR, 'summary_system_prompt_small.md'), 'r', encoding='utf-8') as f:
+    with open(PROMPT_DIR / 'summary_system_prompt_small.md', 'r', encoding='utf-8') as f:
         SUMMARY_SYSTEM_PROMPT_SMALL_TEMPLATE = f.read()
-    with open(os.path.join(PROMPT_DIR, 'summary_user_prompt.md'), 'r', encoding='utf-8') as f:
+    with open(PROMPT_DIR / 'summary_user_prompt.md', 'r', encoding='utf-8') as f:
         SUMMARY_USER_PROMPT_TEMPLATE = f.read()
 except FileNotFoundError as e:
     logger.error(f"プロンプトファイルが見つかりません: {e}")
@@ -92,11 +90,8 @@ except FileNotFoundError as e:
 
 
 def should_use_compact_prompt(size: str) -> bool:
-    """規模区分に基づいてコンパクトプロンプトを使用するかを判定"""
     if not size or size == 'Unknown':
-        return True  # 不明な場合はコンパクト版
-
-    # 大型株は通常版、それ以外はコンパクト版
+        return True
     large_cap_keywords = ['Core30', 'Large70', 'Mid400']
     return not any(keyword in size for keyword in large_cap_keywords)
 
@@ -113,7 +108,6 @@ class Document:
 
 @dataclass
 class DocumentGroup:
-    """証券コードでグループ化された文書群"""
     code: str
     name: str
     sector: str
@@ -135,7 +129,6 @@ def load_metadata(client: storage.Client, bucket: str, base: str, date_str: str)
 
 
 def _extract_text_with_fitz(path: str) -> Optional[str]:
-    """PyMuPDF(fitz)を使用してテキストを抽出する。失敗した場合はNoneを返す。"""
     try:
         with fitz.open(path) as doc:
             texts: List[str] = []
@@ -166,18 +159,12 @@ def _extract_text_with_pypdf(path: str) -> str:
 
 
 def extract_text_from_pdf_file(path: str) -> str:
-    """PDFからテキストを抽出する。fitzを優先し、失敗した場合のみpypdfにフォールバックする。"""
     if FITZ_AVAILABLE:
-        # fitzはより堅牢なため、まず試す
         text = _extract_text_with_fitz(path)
         if text is not None:
-            # fitzが処理できた場合（空文字列を含む）、その結果を返す
             return text
-
-    # fitzが利用不可、または処理に失敗した場合のみpypdfを試す
     if PDF_AVAILABLE:
         return _extract_text_with_pypdf(path)
-
     return ""
 
 
@@ -195,10 +182,8 @@ def extract_text_from_pdf_blob(blob: storage.Blob) -> str:
 
 
 def summarize_text_with_vertex(project: str, location: str, model_name: str, system_prompt: str, user_prompt: str, content: str) -> str:
-    """システムプロンプトとユーザープロンプトを分けてLLMにリクエストする"""
     max_retries = 5
-    initial_backoff = 2  # seconds
-
+    initial_backoff = 2
     for attempt in range(max_retries):
         try:
             vertexai.init(project=project, location=location)
@@ -256,12 +241,55 @@ def build_docs_from_local(local_dir: str, include: Optional[str] = None, codes: 
     return docs
 
 
+def build_docs_from_sector_gcs(client: storage.Client, bucket: str, base: str) -> List[Document]:
+    """業種別ディレクトリ構造からドキュメントを読み込み"""
+    docs: List[Document] = []
+    bucket_obj = client.bucket(bucket)
+    
+    # sectors/ 配下のすべてのPDFファイルを取得
+    prefix = f"{base}/sectors/"
+    blobs = list(client.list_blobs(bucket_obj, prefix=prefix))
+    
+    for blob in blobs:
+        if not blob.name.lower().endswith('.pdf'):
+            continue
+        
+        # ファイル名から情報を抽出: 証券コード_会社名_元ファイル名.pdf
+        filename = blob.name.split('/')[-1]
+        try:
+            # ファイル名をパース
+            name_parts = filename.replace('.pdf', '').split('_', 2)
+            if len(name_parts) >= 3:
+                code = name_parts[0]
+                company_name = name_parts[1]
+                title = name_parts[2]
+            else:
+                # フォールバック
+                code = filename.split('_')[0] if '_' in filename else 'unknown'
+                company_name = ""
+                title = filename.replace('.pdf', '')
+            
+            docs.append(Document(
+                code=code,
+                company_name=company_name,
+                title=title,
+                doc_type="sector_batch",
+                gcs_path=blob.name
+            ))
+        except Exception as e:
+            logger.warning(f"業種別ファイル名のパースに失敗: {filename}, エラー: {e}")
+            continue
+    
+    logger.info(f"業種別ディレクトリから {len(docs)} 件のPDFファイルを検出しました")
+    return docs
+
+
 def generate_summaries(dates: List[str], bucket: str = DEFAULT_BUCKET, base: str = DEFAULT_BASE,
                        project: Optional[str] = None, location: str = DEFAULT_LOCATION,
                        model_name: str = DEFAULT_MODEL,
                        local_dir: Optional[str] = None, include: Optional[str] = None,
-                       codes: Optional[List[str]] = None, max_files: Optional[int] = None) -> List[str]:
-    """特定の日付の開示文書からインサイトを生成する。証券コードごとに資料をまとめて要約。"""
+                       codes: Optional[List[str]] = None, max_files: Optional[int] = None,
+                       sector_mode: bool = False) -> List[str]:
     output_date_str = dates[-1] if dates else datetime.datetime.now().strftime("%Y%m%d")
     logger.info(
         f"インサイト生成開始: 期間={dates[0] if dates else 'N/A'}-{dates[-1] if dates else 'N/A'}, バケット={bucket}, ベースパス={base}, プロジェクト={project or '未指定'}, ロケーション={location}, モデル={model_name}")
@@ -271,20 +299,13 @@ def generate_summaries(dates: List[str], bucket: str = DEFAULT_BUCKET, base: str
         return []
 
     # --- GCSクライアントのカスタマイズ ---
-    # 多数の並列処理に対応するため、接続プールサイズを増やす
     try:
         credentials, project_id_from_auth = google.auth.default()
-        # 引数で渡されたprojectを優先する
         final_project_id = project or project_id_from_auth
-
-        # requests.Session をカスタマイズ
         adapter = requests.adapters.HTTPAdapter(pool_connections=DEFAULT_MAX_WORKERS, pool_maxsize=DEFAULT_MAX_WORKERS)
         session = requests.Session()
         session.mount('https://', adapter)
-
-        # カスタマイズしたセッションで認証済みセッションを作成
         authed_session = google.auth.transport.requests.AuthorizedSession(credentials, session=session)
-
         client = storage.Client(project=final_project_id, credentials=credentials, _http=authed_session)
         logger.info(f"GCSクライアントをカスタマイズしました。プロジェクト: {final_project_id}, 接続プールサイズ: {DEFAULT_MAX_WORKERS}")
     except Exception as e:
@@ -293,17 +314,21 @@ def generate_summaries(dates: List[str], bucket: str = DEFAULT_BUCKET, base: str
 
     company_info_map: Dict[str, tuple[str, str, str]] = {}
     try:
-        from constants import load_company_info_map
-        companies_csv_path = os.path.join(os.path.dirname(__file__), "inputs", "companies.csv")
-        company_info_map = load_company_info_map(companies_csv_path)
+        from tdnet_analyzer.common.constants import load_company_info_map
+        companies_csv_path = project_path('inputs', 'companies.csv')
+        company_info_map = load_company_info_map(str(companies_csv_path))
     except Exception as e:
         logger.warning(f"constants.pyからのcompany_info_mapロードに失敗: {e}。企業名・業種・規模分類はできません。")
 
-    # 1. まず全ドキュメント情報をロード
+    # 1. 全ドキュメント情報をロード
     all_docs: List[Document]
     if local_dir:
         all_docs = build_docs_from_local(local_dir, include, codes, max_files)
         logger.info(f"ローカルディレクトリ {local_dir} から {len(all_docs)} 件の文書をロードしました。")
+    elif sector_mode:
+        # 業種別モード：sectorsディレクトリから読み込み
+        all_docs = build_docs_from_sector_gcs(client, bucket, base)
+        log_info(f"GCS業種別ディレクトリから {len(all_docs)} 件の文書をロードしました。")
     else:
         all_docs = []
         for date_str in dates:
@@ -313,16 +338,15 @@ def generate_summaries(dates: List[str], bucket: str = DEFAULT_BUCKET, base: str
                 logger.warning(f"メタデータの読み込みに失敗しました(date={date_str}): {e}")
         log_info(f"GCSメタデータから {len(all_docs)} 件の文書をロードしました。")
 
-    # 2. 証券コードでグループ化（33業種+規模区分）
+    # 2. 証券コードでグループ化
     doc_groups: Dict[str, DocumentGroup] = defaultdict(lambda: DocumentGroup(code="", name="", sector="", size=""))
     for doc in all_docs:
         if include and include not in doc.title and include not in doc.local_path:
             continue
         if codes and normalize_code(doc.code) not in codes:
             continue
-
         group = doc_groups[doc.code]
-        if not group.code:  # 初回のみ設定
+        if not group.code:
             group.code = doc.code
             company_info = company_info_map.get(normalize_code(doc.code))
             if company_info:
@@ -346,14 +370,11 @@ def generate_summaries(dates: List[str], bucket: str = DEFAULT_BUCKET, base: str
     total_groups = len(groups_to_process)
     processed_groups_count = 0
 
-    # 3. グループごとに並列処理
     with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as executor:
-        # フェーズ1: テキスト抽出を並列実行
         future_to_group_extraction = {}
         for group in groups_to_process:
             future = executor.submit(extract_texts_for_group, group, client, bucket, bool(local_dir))
             future_to_group_extraction[future] = group
-
         for future in as_completed(future_to_group_extraction):
             group = future_to_group_extraction[future]
             try:
@@ -361,33 +382,25 @@ def generate_summaries(dates: List[str], bucket: str = DEFAULT_BUCKET, base: str
             except Exception as e:
                 logger.error(f"テキスト抽出エラー: コード={group.code}, エラー={e}")
                 group.combined_text = ""
-
-        # フェーズ2: LLM要約を並列実行
         future_to_group_summarization = {}
         for group in groups_to_process:
             if not group.combined_text:
                 logger.warning(f"テキストが空のためスキップ: コード={group.code}")
                 continue
-
             titles = [d.title for d in group.documents]
             user_prompt = SUMMARY_USER_PROMPT_TEMPLATE.replace("{{company_code}}", group.code)
             user_prompt = user_prompt.replace("{{company_name}}", group.name or '不明')
             user_prompt = user_prompt.replace("{{sector_name}}", group.sector or '不明')
             user_prompt = user_prompt.replace("{{titles}}", "\n".join([f"- {t}" for t in titles]))
-
-            # 規模区分に応じてプロンプトを選択
             use_compact = should_use_compact_prompt(group.size)
             system_prompt = SUMMARY_SYSTEM_PROMPT_SMALL_TEMPLATE if use_compact else SUMMARY_SYSTEM_PROMPT_TEMPLATE
-
             logger.info(f"プロンプト選択: コード={group.code}, 規模={group.size}, コンパクト={use_compact}")
-
             future = executor.submit(summarize_text_with_vertex,
                                      project, location, model_name,
                                      system_prompt,
                                      user_prompt,
                                      group.combined_text)
             future_to_group_summarization[future] = group
-
         for future in as_completed(future_to_group_summarization):
             processed_groups_count += 1
             group = future_to_group_summarization[future]
@@ -395,11 +408,15 @@ def generate_summaries(dates: List[str], bucket: str = DEFAULT_BUCKET, base: str
                 summary_text = future.result()
                 print(f"INFO: ({processed_groups_count}/{total_groups}) 要約成功: コード={group.code}")
                 logger.info(f"({processed_groups_count}/{total_groups}) 要約成功: コード={group.code}")
-
-                summary_filename = f"{output_date_str}__{safe_name(group.sector)}__{safe_name(group.size)}__{group.code}__{safe_name(group.name)}_summary.md"
-                path_parts = [base, "insights-summaries", output_date_str, summary_filename]
+                if sector_mode:
+                    # 業種別モード：ファイル名形式変更
+                    summary_filename = f"{safe_name(group.sector)}__{safe_name(group.size)}__{group.code}__{safe_name(group.name)}__{output_date_str}_summary.md"
+                    path_parts = [base, "insights-summaries", output_date_str, summary_filename]
+                else:
+                    # 通常モード：既存形式維持
+                    summary_filename = f"{output_date_str}__{safe_name(group.sector)}__{safe_name(group.size)}__{group.code}__{safe_name(group.name)}_summary.md"
+                    path_parts = [base, "insights-summaries", output_date_str, summary_filename]
                 summary_gcs_path = "/".join(part for part in path_parts if part)
-
                 try:
                     blob = client.bucket(bucket).blob(summary_gcs_path)
                     blob.upload_from_string(summary_text.encode('utf-8'), content_type="text/markdown")
@@ -407,16 +424,13 @@ def generate_summaries(dates: List[str], bucket: str = DEFAULT_BUCKET, base: str
                     logger.info(f"  個別サマリをGCSにアップロードしました: gs://{bucket}/{summary_gcs_path}")
                 except Exception as e:
                     logger.error(f"  個別サマリのGCSアップロードエラー (ファイル: {summary_gcs_path}): {e}")
-
             except Exception as e:
                 logger.error(f"({processed_groups_count}/{total_groups}) 要約失敗: コード={group.code}, エラー={e}")
-
     logger.info("generate_summary.py スクリプト完了")
     return outputs
 
 
 def extract_texts_for_group(group: DocumentGroup, client: storage.Client, bucket: str, is_local: bool) -> str:
-    """DocumentGroup内の全ドキュメントのテキストを抽出し、結合する"""
     combined_texts: List[str] = []
     for i, doc in enumerate(group.documents):
         full_text = ""
@@ -429,14 +443,11 @@ def extract_texts_for_group(group: DocumentGroup, client: storage.Client, bucket
         except Exception as e:
             logger.error(f"  (文書 {i+1}/{len(group.documents)}) テキスト抽出エラー: {doc.title}, エラー: {e}")
             full_text = f"--- テキスト抽出エラー: {doc.title} ---\n"
-
         combined_texts.append(f"--- 文書: {doc.title} ---\n{full_text}")
-
     return "\n\n".join(combined_texts)
 
 
 def get_date_range(start_date_str: str, end_date_str: str) -> List[str]:
-    """YYYYMMDD形式の開始日と終了日から日付文字列のリストを生成する"""
     start_date = datetime.datetime.strptime(start_date_str, "%Y%m%d")
     end_date = datetime.datetime.strptime(end_date_str, "%Y%m%d")
     delta = end_date - start_date
@@ -457,12 +468,10 @@ def main():
     parser.add_argument('--include', help='Substring to filter documents by title or path.')
     parser.add_argument('--codes', help='Comma-separated list of company codes to process.')
     parser.add_argument('--max-files', type=int, default=None, help='Limit the number of files to process for debugging.')
-
+    parser.add_argument('--sector-mode', action='store_true', help='Process files from sectors/ directory instead of date-based metadata.')
     args = parser.parse_args()
-
     codes_list = args.codes.split(',') if args.codes else None
     dates_to_process = get_date_range(args.start_date, args.end_date)
-
     try:
         generate_summaries(
             dates=dates_to_process,
@@ -474,7 +483,8 @@ def main():
             local_dir=args.local_dir,
             include=args.include,
             codes=codes_list,
-            max_files=args.max_files
+            max_files=args.max_files,
+            sector_mode=args.sector_mode
         )
         log_info("generate_summary.py スクリプト正常終了")
     except Exception as e:

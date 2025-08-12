@@ -10,6 +10,7 @@ START_DATE=""
 END_DATE=""
 SERVICE_ACCOUNT_KEY_FILE=""
 PROJECT_ID=""
+SECTOR_MODE=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -29,6 +30,10 @@ while [ $# -gt 0 ]; do
       PROJECT_ID="$2"
       shift 2
       ;;
+    --sector-mode)
+      SECTOR_MODE=true
+      shift
+      ;;
     *)
       echo "不明な引数: $1"
       exit 1
@@ -37,7 +42,8 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$START_DATE" ] || [ -z "$END_DATE" ] || [ -z "$SERVICE_ACCOUNT_KEY_FILE" ] || [ -z "$PROJECT_ID" ]; then
-  echo "使用法: $0 --start-date YYYYMMDD --end-date YYYYMMDD --key-file path/to/key.json --project-id YOUR_PROJECT_ID"
+  echo "使用法: $0 --start-date YYYYMMDD --end-date YYYYMMDD --key-file path/to/key.json --project-id YOUR_PROJECT_ID [--sector-mode]"
+  echo "  --sector-mode: 業種別データ処理モード（新機能1対応）"
   exit 1
 fi
 
@@ -68,11 +74,36 @@ REGION="${TDNET_REGION:-"asia-northeast1"}"
 echo "🚀 ステップ1: サマリー生成ジョブを開始します..."
 echo "   ジョブ名: ${SUMMARY_JOB_NAME}"
 echo "   期間: ${START_DATE} から ${END_DATE}"
-gcloud run jobs execute "${SUMMARY_JOB_NAME}" \
-  --project "${PROJECT_ID}" \
-  --region "${REGION}" \
-  --wait \
-  --args="generate_summary.py,--start-date,${START_DATE},--end-date,${END_DATE},--project,${PROJECT_ID}"
+if [ "$SECTOR_MODE" = true ]; then
+  # 業種別モード
+  gcloud run jobs execute "${SUMMARY_JOB_NAME}" \
+    --project "${PROJECT_ID}" \
+    --region "${REGION}" \
+    --wait \
+    --args=-m \
+    --args=tdnet_analyzer.batch.generate_summary \
+    --args=--start-date \
+    --args="${START_DATE}" \
+    --args=--end-date \
+    --args="${END_DATE}" \
+    --args=--project \
+    --args="${PROJECT_ID}" \
+    --args=--sector-mode
+else
+  # 通常モード
+  gcloud run jobs execute "${SUMMARY_JOB_NAME}" \
+    --project "${PROJECT_ID}" \
+    --region "${REGION}" \
+    --wait \
+    --args=-m \
+    --args=tdnet_analyzer.batch.generate_summary \
+    --args=--start-date \
+    --args="${START_DATE}" \
+    --args=--end-date \
+    --args="${END_DATE}" \
+    --args=--project \
+    --args="${PROJECT_ID}"
+fi
 
 echo "✅ ステップ1: サマリー生成ジョブが完了しました。"
 echo ""
@@ -82,11 +113,36 @@ echo ""
 echo "🚀 ステップ2: インサイト生成ジョブを開始します..."
 echo "   ジョブ名: ${INSIGHT_JOB_NAME}"
 echo "   期間: ${START_DATE} から ${END_DATE}"
-gcloud run jobs execute "${INSIGHT_JOB_NAME}" \
-  --project "${PROJECT_ID}" \
-  --region "${REGION}" \
-  --wait \
-  --args="generate_sector_insights.py,--start-date,${START_DATE},--end-date,${END_DATE},--project,${PROJECT_ID}"
+if [ "$SECTOR_MODE" = true ]; then
+  # 業種別モード
+  gcloud run jobs execute "${INSIGHT_JOB_NAME}" \
+    --project "${PROJECT_ID}" \
+    --region "${REGION}" \
+    --wait \
+    --args=-m \
+    --args=tdnet_analyzer.batch.generate_sector_insights \
+    --args=--start-date \
+    --args="${START_DATE}" \
+    --args=--end-date \
+    --args="${END_DATE}" \
+    --args=--project \
+    --args="${PROJECT_ID}" \
+    --args=--sector-mode
+else
+  # 通常モード
+  gcloud run jobs execute "${INSIGHT_JOB_NAME}" \
+    --project "${PROJECT_ID}" \
+    --region "${REGION}" \
+    --wait \
+    --args=-m \
+    --args=tdnet_analyzer.batch.generate_sector_insights \
+    --args=--start-date \
+    --args="${START_DATE}" \
+    --args=--end-date \
+    --args="${END_DATE}" \
+    --args=--project \
+    --args="${PROJECT_ID}"
+fi
 
 echo "✅ ステップ2: インサイト生成ジョブが完了しました。"
 echo ""

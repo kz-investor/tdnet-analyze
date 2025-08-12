@@ -35,21 +35,19 @@ def normalize_code(code: str) -> str:
     - 5桁かつ末尾が'0'なら末尾0を削除（例: 64030 -> 6403）
     - 英字含むコードは大文字に統一（例: 130a -> 130A）
     - 前後空白を除去
+    - 5桁数値は最後の桁を削除（例: 13264 -> 1326）
     """
     if not code:
         return code
     c = code.strip().upper()
-    # 5桁かつ末尾が'0'なら末尾0を削除
     if len(c) == 5 and c.endswith('0') and c[:-1].isdigit():
         return c[:-1]
-    # 5桁で末尾が数字なら末尾1桁を削除（例: 13264 -> 1326）
-    if len(c) == 5 and c.isdigit():  # ここを修正: c.isdigit()で数字のみか確認
+    if len(c) == 5 and c.isdigit():
         return c[:-1]
     return c
 
 
 def load_company_market_map(path: str) -> Dict[str, str]:
-    """企業コードと市場区分のマップをCSVから読み込む"""
     mapping: Dict[str, str] = {}
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
@@ -65,7 +63,6 @@ def load_company_market_map(path: str) -> Dict[str, str]:
 
 
 def load_company_sector_map(path: str) -> Dict[str, str]:
-    """企業コードと33業種区分のマップをCSVから読み込む"""
     mapping: Dict[str, str] = {}
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
@@ -81,19 +78,14 @@ def load_company_sector_map(path: str) -> Dict[str, str]:
 
 
 def normalize_size(size: str) -> str:
-    """規模区分を短縮形に正規化"""
     if not size or size == '-':
         return 'Unknown'
-
-    # TOPIX系の短縮
     if size.startswith('TOPIX '):
         return size.replace('TOPIX ', '')
-
     return size
 
 
 def load_company_size_map(path: str) -> Dict[str, str]:
-    """企業コードと規模区分のマップをCSVから読み込む"""
     mapping: Dict[str, str] = {}
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
@@ -102,7 +94,6 @@ def load_company_size_map(path: str) -> Dict[str, str]:
                 code = row.get(CSV_COLUMN_CODE)
                 size = row.get(CSV_COLUMN_SIZE)
                 if code:
-                    # 規模区分が空や'-'の場合はUnknownにする
                     normalized_size = normalize_size(size) if size else 'Unknown'
                     mapping[normalize_code(code)] = normalized_size
     except FileNotFoundError:
@@ -111,7 +102,6 @@ def load_company_size_map(path: str) -> Dict[str, str]:
 
 
 def load_company_sector_size_map(path: str) -> Dict[str, tuple[str, str]]:
-    """企業コードと(33業種区分, 規模区分)のタプルマップをCSVから読み込む"""
     mapping: Dict[str, tuple[str, str]] = {}
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
@@ -121,7 +111,6 @@ def load_company_sector_size_map(path: str) -> Dict[str, tuple[str, str]]:
                 sector = row.get(CSV_COLUMN_SECTOR)
                 size = row.get(CSV_COLUMN_SIZE)
                 if code:
-                    # セクターが空の場合はUnknown、規模区分も正規化
                     normalized_sector = sector if sector else 'Unknown'
                     normalized_size = normalize_size(size) if size else 'Unknown'
                     mapping[normalize_code(code)] = (normalized_sector, normalized_size)
@@ -131,7 +120,6 @@ def load_company_sector_size_map(path: str) -> Dict[str, tuple[str, str]]:
 
 
 def load_company_info_map(path: str) -> Dict[str, tuple[str, str, str]]:
-    """企業コードと(企業名, 33業種区分, 規模区分)のタプルマップをCSVから読み込む"""
     mapping: Dict[str, tuple[str, str, str]] = {}
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
@@ -142,7 +130,6 @@ def load_company_info_map(path: str) -> Dict[str, tuple[str, str, str]]:
                 sector = row.get(CSV_COLUMN_SECTOR)
                 size = row.get(CSV_COLUMN_SIZE)
                 if code:
-                    # 各値の正規化
                     normalized_name = name if name else 'Unknown'
                     normalized_sector = sector if sector else 'Unknown'
                     normalized_size = normalize_size(size) if size else 'Unknown'

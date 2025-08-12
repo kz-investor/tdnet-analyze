@@ -80,16 +80,15 @@ function cleanup {
 }
 trap cleanup EXIT
 
-# --- スケジューラのボディを一時的に変更 ---
-BODY="{\\"date\\":\\"${EXEC_DATE}\\"}"
-echo "🔧 スケジューラのメッセージボディを一時的に変更します..."
-echo "   変更後ボディ: ${BODY}"
+# --- クエリパラメータで日付を渡す（Content-Type問題を回避） ---
+NEW_URI="${CF_URL}?date=${EXEC_DATE}"
+echo "🔧 スケジューラのURIを一時的に変更します..."
+echo "   新URI: ${NEW_URI}"
 gcloud scheduler jobs update http "${SCHEDULER_JOB_NAME}" \
   --project "${PROJECT_ID}" \
   --location "${REGION}" \
-  --uri="${CF_URL}" \
+  --uri="${NEW_URI}" \
   --http-method=POST \
-  --message-body="${BODY}" \
   --description="[MANUAL RUN] Trigger TDnet Scraper for ${EXEC_DATE}"
 
 # --- スケジューラジョブの実行 ---
