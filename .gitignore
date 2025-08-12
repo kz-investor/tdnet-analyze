@@ -24,3 +24,6 @@ keys/*.json
 *.zip
 *.tar
 *.tar.gz 
+
+instructions/
+docs/operations/

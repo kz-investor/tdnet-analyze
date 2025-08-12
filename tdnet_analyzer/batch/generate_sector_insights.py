@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import re
 import argparse
 import os
 import sys
@@ -19,6 +18,8 @@ import time
 import random
 from google.api_core import exceptions
 
+from tdnet_analyzer.common.path_utils import project_path
+
 # ロギング設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 # --- グローバル設定 ---
 CONFIG = {}
 try:
-    with open("config/config.yaml", "r") as f:
+    with open(project_path('config', 'config.yaml'), "r") as f:
         CONFIG = yaml.safe_load(f)
 except FileNotFoundError:
     logger.warning("config/config.yamlが見つかりません。")
@@ -41,11 +42,11 @@ DEFAULT_MODEL = CONFIG.get('llm', {}).get('model_name', 'gemini-1.0-pro')
 DEFAULT_MAX_WORKERS = CONFIG.get('llm', {}).get('parallel', {}).get('max_workers', 10)
 
 # プロンプトの読み込み
-PROMPT_DIR = os.path.join(os.path.dirname(__file__), 'prompt_templates')
+PROMPT_DIR = project_path('prompt_templates')
 try:
-    with open(os.path.join(PROMPT_DIR, 'sector_system_prompt.md'), 'r', encoding='utf-8') as f:
+    with open(PROMPT_DIR / 'sector_system_prompt.md', 'r', encoding='utf-8') as f:
         SECTOR_SYSTEM_PROMPT_TEMPLATE = f.read()
-    with open(os.path.join(PROMPT_DIR, 'sector_user_prompt.md'), 'r', encoding='utf-8') as f:
+    with open(PROMPT_DIR / 'sector_user_prompt.md', 'r', encoding='utf-8') as f:
         SECTOR_USER_PROMPT_TEMPLATE = f.read()
 except FileNotFoundError as e:
     logger.error(f"プロンプトファイルが見つかりません: {e}")
@@ -53,10 +54,8 @@ except FileNotFoundError as e:
 
 
 def summarize_text_with_vertex(project: str, location: str, model_name: str, system_prompt: str, user_prompt: str) -> str:
-    """システムプロンプトとユーザープロンプトを分けてLLMにリクエストする"""
     max_retries = 5
-    initial_backoff = 2  # seconds
-
+    initial_backoff = 2
     for attempt in range(max_retries):
         try:
             vertexai.init(project=project, location=location)
@@ -82,15 +81,14 @@ def safe_name(name: str, max_len: int = 50) -> str:
 
 
 def get_date_range(start_date_str: str, end_date_str: str) -> list[str]:
-    """YYYYMMDD形式の開始日と終了日から日付文字列のリストを生成する"""
-    import datetime
-    start_date = datetime.datetime.strptime(start_date_str, "%Y%m%d")
-    end_date = datetime.datetime.strptime(end_date_str, "%Y%m%d")
+    import datetime as _dt
+    start_date = _dt.datetime.strptime(start_date_str, "%Y%m%d")
+    end_date = _dt.datetime.strptime(end_date_str, "%Y%m%d")
     delta = end_date - start_date
-    return [(start_date + datetime.timedelta(days=i)).strftime("%Y%m%d") for i in range(delta.days + 1)]
+    return [(start_date + _dt.timedelta(days=i)).strftime("%Y%m%d") for i in range(delta.days + 1)]
 
 
-def generate_sector_insights(dates: list[str], bucket: str, base: str, project: str, location: str, model_name: str):
+def generate_sector_insights(dates: list[str], bucket: str, base: str, project: str, location: str, model_name: str, sector_mode: bool = False):
     output_date_str = dates[-1] if dates else datetime.datetime.now().strftime("%Y%m%d")
     logger.info(f"業種インサイト生成開始: 期間={dates[0] if dates else 'N/A'}-{dates[-1] if dates else 'N/A'}, バケット={bucket}, ベースパス={base}")
 
@@ -98,13 +96,24 @@ def generate_sector_insights(dates: list[str], bucket: str, base: str, project: 
     bucket_obj = client.bucket(bucket)
 
     all_blobs = []
-    for date_str in dates:
-        path_parts = [base, "insights-summaries", date_str]
+    if sector_mode:
+        # 業種別モード：最新日付のみを参照
+        latest_date = dates[-1] if dates else datetime.datetime.now().strftime("%Y%m%d")
+        path_parts = [base, "insights-summaries", latest_date]
         prefix = "/".join(part for part in path_parts if part) + "/"
         blobs = list(client.list_blobs(bucket_obj, prefix=prefix))
         if not blobs:
             logger.warning(f"GCSに処理対象の個別サマリーファイルが見つかりません: gs://{bucket}/{prefix}")
         all_blobs.extend(blobs)
+    else:
+        # 通常モード：全日付を参照
+        for date_str in dates:
+            path_parts = [base, "insights-summaries", date_str]
+            prefix = "/".join(part for part in path_parts if part) + "/"
+            blobs = list(client.list_blobs(bucket_obj, prefix=prefix))
+            if not blobs:
+                logger.warning(f"GCSに処理対象の個別サマリーファイルが見つかりません: gs://{bucket}/{prefix}")
+            all_blobs.extend(blobs)
 
     if not all_blobs:
         logger.warning(f"指定された期間に処理対象の個別サマリーファイルが1件も見つかりませんでした。")
@@ -116,21 +125,25 @@ def generate_sector_insights(dates: list[str], bucket: str, base: str, project: 
         try:
             filename = blob.name.split('/')[-1]
             base_name, ext = os.path.splitext(filename)
-
             if ext == '.md' and base_name.endswith('_summary'):
                 core_name = base_name[:-len('_summary')]
                 parts = core_name.split('__')
-
-                if len(parts) == 5:
-                    # date, sector, size, code, company_name
+                if sector_mode and len(parts) == 5:
+                    # 業種別モード：業種__規模__コード__会社名__日付_summary.md
+                    sector = parts[0]
+                    size_classification = parts[1]
+                    sector_size_key = f"{sector}_{size_classification}"
+                    content = blob.download_as_text()
+                    sector_docs[sector_size_key].append(content)
+                elif not sector_mode and len(parts) == 5:
+                    # 通常モード：日付__業種__規模__コード__会社名_summary.md
                     sector = parts[1]
                     size_classification = parts[2]
                     sector_size_key = f"{sector}_{size_classification}"
-
                     content = blob.download_as_text()
                     sector_docs[sector_size_key].append(content)
                 else:
-                    logger.warning(f"ファイル名の形式が不正なため業種・規模を抽出できません: {filename}")
+                    logger.warning(f"ファイル名の形式が不正なため業種・規模を抽出できません: {filename} (parts: {len(parts)})")
             else:
                 logger.warning(f"予期しないファイル形式です: {filename}")
         except Exception as e:
@@ -143,10 +156,8 @@ def generate_sector_insights(dates: list[str], bucket: str, base: str, project: 
     with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as executor:
         future_to_sector = {}
         for sector_size_key, docs in sector_docs.items():
-            # システムプロンプトとユーザープロンプトの両方で変数を置換する
             system_prompt = SECTOR_SYSTEM_PROMPT_TEMPLATE.replace("{{sector_name}}", sector_size_key).replace("{{count}}", str(len(docs)))
             user_prompt = SECTOR_USER_PROMPT_TEMPLATE.replace("{{summaries}}", "\n\n".join(docs))
-
             future = executor.submit(
                 summarize_text_with_vertex,
                 project, location, model_name,
@@ -154,7 +165,6 @@ def generate_sector_insights(dates: list[str], bucket: str, base: str, project: 
                 user_prompt
             )
             future_to_sector[future] = sector_size_key
-
         for future in as_completed(future_to_sector):
             sector_size_key = future_to_sector[future]
             try:
@@ -181,15 +191,12 @@ def main():
     parser.add_argument('--project', default=os.environ.get('GOOGLE_CLOUD_PROJECT'), help='Google Cloud Project ID.')
     parser.add_argument('--location', default=DEFAULT_LOCATION, help='Vertex AI location.')
     parser.add_argument('--model', default=DEFAULT_MODEL, help=f'Vertex AI model name (default: {DEFAULT_MODEL})')
-
+    parser.add_argument('--sector-mode', action='store_true', help='Process sector-mode summaries (different filename format).')
     args = parser.parse_args()
-
     if not args.project:
         logger.error("Google Cloud Project IDが指定されていません。--project オプションで指定するか、環境変数 GOOGLE_CLOUD_PROJECT を設定してください。")
         sys.exit(1)
-
     dates_to_process = get_date_range(args.start_date, args.end_date)
-
     try:
         generate_sector_insights(
             dates=dates_to_process,
@@ -198,6 +205,7 @@ def main():
             project=args.project,
             location=args.location,
             model_name=args.model,
+            sector_mode=args.sector_mode,
         )
         logger.info("generate_sector_insights.py スクリプト正常終了")
     except Exception as e:

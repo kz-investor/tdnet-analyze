@@ -43,7 +43,7 @@ echo "✅ 認証完了。プロジェクトID: ${PROJECT_ID} を使用してデ�
 
 # --- 設定 ---
 source deploy.env
-REGION="${TDNET_REGION:-"asia-northeast1"}" # デフォルトは東京リージョン
+REGION="${TDNET_REGION:-"asia-northeast1"}"
 SERVICE_ACCOUNT_EMAIL=$(grep "client_email" "${SERVICE_ACCOUNT_KEY_FILE}" | awk -F '"' '{print $4}')
 if [ -z "${SERVICE_ACCOUNT_EMAIL}" ]; then
     echo "❌ エラー: サービスアカウントキーファイルからメールアドレスを取得できませんでした。"
@@ -52,23 +52,19 @@ fi
 echo "ℹ️ 実行サービスアカウント: ${SERVICE_ACCOUNT_EMAIL}"
 
 # --- リソース名 ---
-# Cloud Function
 CF_SCRAPER_NAME="tdnet-scraper"
-# Cloud Scheduler
 SCHEDULER_JOB_NAME="tdnet-scraper-daily-trigger"
-# Artifact Registry
 AR_REPO_NAME="tdnet-analyzer-repo"
-# Cloud Run Jobs
 CR_SUMMARY_JOB_NAME="tdnet-summary-generator"
 CR_INSIGHT_JOB_NAME="tdnet-insight-generator"
+CR_BATCH_SCRAPER_JOB_NAME="tdnet-batch-scraper"
+CR_TIMESERIES_JOB_NAME="tdnet-timeseries-analyzer"
 
 IMAGE_NAME="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO_NAME}/tdnet-analyzer:latest"
-
 
 # --- APIサービスの有効化 ---
 echo "🔄 必要なAPIサービスを有効化しています..."
 gcloud services enable cloudfunctions.googleapis.com cloudbuild.googleapis.com cloudscheduler.googleapis.com artifactregistry.googleapis.com run.googleapis.com --project "${PROJECT_ID}"
-
 
 # --- セクション1: Cloud Function (日次スクレイピング) ---
 echo -e "\n--- セクション1: Cloud Function (日次スクレイピング) のデプロイを開始 ---"
@@ -90,8 +86,7 @@ gcloud functions deploy "${CF_SCRAPER_NAME}" \
 CF_URL=$(gcloud functions describe "${CF_SCRAPER_NAME}" --region "${REGION}" --gen2 --format='value(serviceConfig.uri)' --project "${PROJECT_ID}")
 echo "✅ Cloud Function (${CF_SCRAPER_NAME}) のデプロイ完了。"
 
-
-# --- セクション2: Cloud Scheduler (日次実行トリガー) ---
+# --- セクション2: Cloud Scheduler ---
 echo -e "\n--- セクション2: Cloud Scheduler ジョブの作成/更新を開始 ---"
 
 gcloud scheduler jobs create http "${SCHEDULER_JOB_NAME}" \
@@ -105,7 +100,7 @@ gcloud scheduler jobs create http "${SCHEDULER_JOB_NAME}" \
     --attempt-deadline="320s" \
     --project "${PROJECT_ID}" \
     || \
-gcloud scheduler jobs update http "${SCHEDULER_JOB_NAME}" \
+  gcloud scheduler jobs update http "${SCHEDULER_JOB_NAME}" \
     --location "${REGION}" \
     --schedule="0 19 * * *" \
     --uri="${CF_URL}" \
@@ -116,11 +111,9 @@ gcloud scheduler jobs update http "${SCHEDULER_JOB_NAME}" \
 
 echo "✅ Cloud Scheduler (${SCHEDULER_JOB_NAME}) の設定完了。"
 
-
-# --- セクション3: Cloud Run ジョブ (期間指定バッチ) ---
+# --- セクション3: Cloud Run ジョブ ---
 echo -e "\n--- セクション3: Cloud Run ジョブのデプロイを開始 ---"
 
-# 3a. Artifact Registry リポジトリの作成
 echo "--- Artifact Registry リポジトリの確認/作成 ---"
 if ! gcloud artifacts repositories describe "${AR_REPO_NAME}" --location="${REGION}" --project="${PROJECT_ID}" &>/dev/null; then
     echo "Artifact Registryリポジトリ ${AR_REPO_NAME} を作成します..."
@@ -133,11 +126,9 @@ else
     echo "Artifact Registryリポジトリ ${AR_REPO_NAME} は既に存在します。"
 fi
 
-# 3b. Dockerイメージのビルドとプッシュ
 echo "--- Dockerイメージのビルドとプッシュ ---"
 gcloud builds submit --tag "${IMAGE_NAME}" --project "${PROJECT_ID}"
 
-# 3c. Cloud Run ジョブのデプロイ
 COMMON_JOB_FLAGS=(
   --region "${REGION}"
   --service-account "${SERVICE_ACCOUNT_EMAIL}"
@@ -148,16 +139,33 @@ COMMON_JOB_FLAGS=(
   --cpu "${CR_CPU}"
   --memory "${CR_MEMORY}"
 )
+
 echo "--- Summary Generator ジョブのデプロイ (CPU: ${CR_CPU}, Memory: ${CR_MEMORY}) ---"
 gcloud run jobs deploy "${CR_SUMMARY_JOB_NAME}" \
   "${COMMON_JOB_FLAGS[@]}" \
-  --args="generate_summary.py" \
+  --command python3 \
+  --args="-m,tdnet_analyzer.batch.generate_summary" \
   --project "${PROJECT_ID}"
 
 echo "--- Insight Generator ジョブのデプロイ (CPU: ${CR_CPU}, Memory: ${CR_MEMORY}) ---"
 gcloud run jobs deploy "${CR_INSIGHT_JOB_NAME}" \
   "${COMMON_JOB_FLAGS[@]}" \
-  --args="generate_sector_insights.py" \
+  --command python3 \
+  --args="-m,tdnet_analyzer.batch.generate_sector_insights" \
+  --project "${PROJECT_ID}"
+
+echo "--- Batch Scraper ジョブのデプロイ (CPU: ${CR_CPU}, Memory: ${CR_MEMORY}) ---"
+gcloud run jobs deploy "${CR_BATCH_SCRAPER_JOB_NAME}" \
+  "${COMMON_JOB_FLAGS[@]}" \
+  --command python3 \
+  --args="-m,tdnet_analyzer.batch.batch_scraper" \
+  --project "${PROJECT_ID}"
+
+echo "--- Timeseries Analyzer ジョブのデプロイ (CPU: ${CR_CPU}, Memory: ${CR_MEMORY}) ---"
+gcloud run jobs deploy "${CR_TIMESERIES_JOB_NAME}" \
+  "${COMMON_JOB_FLAGS[@]}" \
+  --command python3 \
+  --args="-m,tdnet_analyzer.batch.sector_timeseries_analysis" \
   --project "${PROJECT_ID}"
 
 echo "✅ Cloud Run ジョブのデプロイ完了。"

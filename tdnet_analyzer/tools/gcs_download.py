@@ -10,7 +10,6 @@ DEFAULT_BASE = os.environ.get("TDNET_BASE", "tdnet-analyzer")
 
 
 def list_blobs_for_date(client: storage.Client, bucket_name: str, base_path: str, date_str: str):
-    """指定された日付のGCS Blobをリストアップする"""
     year, month, day = date_str[:4], date_str[4:6], date_str[6:8]
     prefix = f"{base_path}/{year}/{month}/{day}/"
     bucket = client.bucket(bucket_name)

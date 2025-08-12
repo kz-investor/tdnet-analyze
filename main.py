@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Cloud Functions - TDnet Scraper
-Cloud Schedulerから呼び出されてtdnet_cloud.pyを実行する
+Cloud Schedulerから呼び出されてパッケージ内のクラウドスクレイパーを実行
 """
 import functions_framework
 import os
@@ -12,10 +12,6 @@ import pytz
 import subprocess
 import shlex
 
-# tdnet_cloud.pyのパスを設定
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TDNET_CLOUD_PATH = os.path.join(SCRIPT_DIR, 'tdnet_cloud.py')
-
 
 @functions_framework.http
 def trigger_scraper(request):
@@ -24,8 +20,7 @@ def trigger_scraper(request):
     リクエストで日付が指定されていない場合は、JSTの今日の日付を使用する。
     """
     try:
-        # 日付の決定ロジックを修正
-        # POST (gcloud scheduler) のJSONボディと、GETのクエリ引数の両方に対応
+        # POST(JSON) と GET(query) の両対応
         date_str = None
         request_json = request.get_json(silent=True)
         if request_json and 'date' in request_json:
@@ -40,20 +35,18 @@ def trigger_scraper(request):
         else:
             print(f"INFO: 指定された日付で実行します: {date_str}")
 
-        # 実行コマンドの構築
+        # パッケージモジュールとして実行（ENTRYPOINT python3 を前提）
         cmd = [
-            sys.executable, '-u',
-            TDNET_CLOUD_PATH,
+            sys.executable, '-u', '-m',
+            'tdnet_analyzer.scraper.tdnet_cloud',
             '--date', date_str,
         ]
 
         print(f"INFO: 実行コマンド: {' '.join(shlex.quote(c) for c in cmd)}")
         print("INFO: スクレイピング処理を開始します...")
 
-        # サブプロセスとしてスクリプトを実行
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
-        # 標準出力と標準エラーをログに出力
         if result.stdout:
             print("--- STDOUT ---")
             print(result.stdout)

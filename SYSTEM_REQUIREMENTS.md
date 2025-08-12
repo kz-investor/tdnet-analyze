@@ -36,8 +36,8 @@
 
 本システムは、以下の2つの独立した処理フローから構成されるハイブリッドアーキテクチャを採用する。
 
-1.  **日次データ取得フロー（自動実行）**: 軽量で定時実行に適した**Cloud Function**を使用。Cloud Schedulerをトリガーとし、その日のTDnet開示PDFをGCSに収集・保存する。
-2.  **分析バッチ処理フロー（手動実行）**: 長時間実行（最大60分）と安定性が求められる分析処理には**Cloud Run ジョブ**を使用。ユーザーが手動でスクリプトを実行すると起動し、指定された期間のPDFを対象に、サマリー生成とインサイト抽出を順番に実行する。
+1.  **日次データ取得フロー（自動実行）**: Cloud Function。Cloud Schedulerをトリガーとして、その日のTDnet開示PDFをGCSに収集・保存。
+2.  **分析バッチ処理フロー（手動実行）**: Cloud Run ジョブ。ユーザーが手動で実行し、指定期間のPDFを対象にサマリー生成とインサイト抽出を順次実行。
 
 ```mermaid
 graph TD
@@ -49,12 +49,10 @@ graph TD
     subgraph "分析バッチ処理フロー (手動)"
         D[手動実行<br/>run_manual_batch.sh] --> E{Cloud Run ジョブ<br/>tdnet-summary-generator};
         E -- 処理完了を待つ --> F{Cloud Run ジョブ<br/>tdnet-insight-generator};
-        
         E -- PDF読み込み --> C;
         E -- サマリー書き込み --> G[☁️ Google Cloud Storage<br/>tdnet-analyzer/insights-summaries/...];
         F -- サマリー読み込み --> G;
         F -- インサイト書き込み --> H[☁️ Google Cloud Storage<br/>tdnet-analyzer/insights-sectors/...];
-        
         E -- LLM API --> I((Vertex AI<br/>Gemini));
         F -- LLM API --> I;
     end
@@ -62,26 +60,35 @@ graph TD
 
 ### 2.2 実行環境
 
--   **Cloud Function (`tdnet-scraper`) 設定:**
-    -   役割: 日次スクレイピング
-    -   Runtime: Python 3.11
-    -   Timeout: **540s** (9分)
-    -   Memory: **1Gi**
-    -   Retries: 0
--   **Cloud Run ジョブ (`tdnet-summary-generator`, `tdnet-insight-generator`) 設定:**
-    -   役割: 期間指定のサマリー/インサイト生成
-    -   Timeout: **3600s** (60分)
-    -   Memory: **2Gi**
-    -   CPU: **1**
-    -   Tasks: 1 (同時実行数)
--   **Cloud Scheduler (`tdnet-scraper-daily-trigger`) 設定:**
-    -   役割: Cloud Functionの定時実行トリガー
-    -   Schedule: `0 19 * * *` (JST 19:00)
+- **Cloud Function (`tdnet-scraper`)**
+  - Runtime: Python 3.11, Timeout: 540s, Memory: 1Gi, Retries: 0
+- **Cloud Run ジョブ**
+  - Timeout: 3600s, Memory: 2Gi, CPU: 1, Tasks: 1, Retries: 0
+- **Cloud Scheduler**
+  - Schedule: `0 19 * * *` (JST 19:00)
 
 ### 2.3 依存関係管理
 - `requirements.txt`: ローカル開発・デバッグ用。
-- `requirements-functions.txt`: Cloud FunctionおよびCloud Runジョブの本番環境用。
-- `Dockerfile`: `requirements-functions.txt` を `requirements.txt` としてコピーし、Cloud Runジョブ用のコンテナをビルドする。
+- `requirements-functions.txt`: Cloud Functions/Run用。
+- `Dockerfile`: `requirements-functions.txt` をベースにコンテナを構築。ENTRYPOINTは `python3`。
+
+### 2.4 ディレクトリ/主要ファイル（パッケージ化後）
+- `tdnet_analyzer/common/path_utils.py`: ルート解決ヘルパー（`project_path()`）。相対パス参照は原則ここ経由。
+- `tdnet_analyzer/common/constants.py`: 企業CSVローダ、正規化関数。
+- `tdnet_analyzer/scraper/tdnet_base.py`: スクレイピング基盤。
+- `tdnet_analyzer/scraper/tdnet_cloud.py`: GCS保存/メタデータ作成。Cloud Functions/CLIエントリ（`-m`実行）。
+- `tdnet_analyzer/batch/generate_summary.py`: 個別サマリー生成（`-m`実行）。
+- `tdnet_analyzer/batch/generate_sector_insights.py`: セクターインサイト生成（`-m`実行）。
+- `tdnet_analyzer/tools/gcs_download.py`: GCS→ローカル。
+- `tdnet_analyzer/tools/analyze_companies.py`: 企業データ分析。
+- `config/config.yaml`: 設定。
+- `main.py`: Cloud Functions HTTPエントリ（パッケージモジュールをサブプロセス実行）。
+- `deploy.sh`: デプロイ。
+- `run_manual_batch.sh`: 手動バッチ実行。
+
+### 2.5 パス設計（重要）
+- すべてのファイル参照は `project_path()` を通じてルート起点で解決（`config/`, `inputs/`, `prompt_templates/`）。
+- `__file__` からの相対参照や、作業ディレクトリ依存は使用しない。
 
 ### 2.4 スクレイピング設計
 - HTTPクライアント: `requests`ライブラリを使用。セッション管理を行い、効率的な通信を実現。
